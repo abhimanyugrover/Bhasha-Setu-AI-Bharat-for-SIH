@@ -263,7 +263,7 @@ def polish_translation_with_llm(
 
     try:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        for m_name in ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]:
+        for m_name in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]:
             try:
                 resp = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",

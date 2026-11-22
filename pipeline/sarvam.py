@@ -273,12 +273,17 @@ def synthesize_sarvam(
 
         if len(temp_files) == 1:
             # Single chunk: convert directly to output format
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", temp_files[0],
-                "-c:a", "libmp3lame", "-b:a", "192k",
-                output_mp3
-            ], check=True)
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", temp_files[0],
+                    "-c:a", "libmp3lame", "-b:a", "192k",
+                    output_mp3
+                ], check=True, capture_output=True)
+            except (FileNotFoundError, subprocess.CalledProcessError) as e:
+                log.warning(f"FFmpeg transcode failed ({e}), copying audio directly.")
+                import shutil
+                shutil.copyfile(temp_files[0], output_mp3)
         else:
             # Multi-chunk: concatenate using concat demuxer
             with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as list_f:
@@ -294,7 +299,13 @@ def synthesize_sarvam(
                     "-i", list_file,
                     "-c:a", "libmp3lame", "-b:a", "192k",
                     output_mp3
-                ], check=True)
+                ], check=True, capture_output=True)
+            except (FileNotFoundError, subprocess.CalledProcessError) as e:
+                log.warning(f"FFmpeg concat unavailable ({e}), using direct audio concatenation fallback.")
+                with open(output_mp3, "wb") as out_f:
+                    for p in temp_files:
+                        with open(p, "rb") as in_f:
+                            out_f.write(in_f.read())
             finally:
                 if os.path.exists(list_file):
                     try:

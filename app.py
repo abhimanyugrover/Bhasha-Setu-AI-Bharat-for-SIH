@@ -1964,9 +1964,10 @@ with t_dub:
                         unsafe_allow_html=True)
                     st.error(f"**{t('err_pipeline_error')}:** {ex}")
                 finally:
-                    if not hil_enable and video_path and os.path.exists(video_path):
-                        try: os.remove(video_path)
-                        except Exception: pass
+                    if video_path and os.path.exists(video_path):
+                        if not hil_enable or st.session_state.get("hil_phase") != "review":
+                            try: os.remove(video_path)
+                            except Exception: pass
 
         elif not PIPELINE_READY:
             st.info(t("err_install_deps"))
@@ -2420,6 +2421,9 @@ with t_hil:
                                 unsafe_allow_html=True)
                     st.rerun()
                 except Exception as ex:
+                    if vpath and os.path.exists(vpath):
+                        try: os.remove(vpath)
+                        except Exception: pass
                     st.error(str(ex))
 
     with h2:
@@ -2467,8 +2471,21 @@ with t_hil:
                     hil_sel_spk = st.selectbox("Sarvam Voice Speaker", spk_names, index=0, key="hil_sarvam_spk_sel")
                     hil_sarvam_spk = hil_sel_spk.lower().strip()
 
-                if st.button(t("btn_approve_synthesize"), key="hil_app2", type="primary",
-                             use_container_width=True):
+                btn_col1, btn_col2 = st.columns([2, 1])
+                with btn_col1:
+                    app_clicked = st.button(t("btn_approve_synthesize"), key="hil_app2", type="primary",
+                                            use_container_width=True)
+                with btn_col2:
+                    if st.button(t("btn_cancel"), key="hil4_cancel", use_container_width=True):
+                        if st.session_state.get("hil4_tmp") and os.path.exists(st.session_state["hil4_tmp"]):
+                            try: os.remove(st.session_state["hil4_tmp"])
+                            except Exception: pass
+                        st.session_state.hil4_phase = "idle"
+                        st.session_state.hil4_data = None
+                        st.session_state.hil4_tmp = None
+                        st.rerun()
+
+                if app_clicked:
                     ph2 = st.empty()
                     p2_pcts = [100,100,100,0,0]; p2_msgs = [""]*5
                     def _hcb2(stage, pct, msg):

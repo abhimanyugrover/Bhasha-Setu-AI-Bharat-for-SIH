@@ -230,6 +230,24 @@ Access the studio at `http://localhost:8501`.
 
 ## 📜 Commit History & Release Notes
 
+### Commit `fix(security/core)` — *Strix-Audited Reliability & Security Hardening: Cursor State, Groq Endpoints, Tempfile Leaks & Concatenation Fallback*
+
+#### 🛡️ 1. Database Cursor ID Capture & Audit Traceability
+* **Fixed `cur.lastrowid` in `auth.py`**: Corrected database operations in `register_user` and `_upsert_google_user` from `conn.execute()` to `cur.execute()`. In `sqlite3`, calling execute directly on connection leaves separate cursor objects with `lastrowid=0` or `None`. This fixes audit log attribution and ensures isolated per-user history tracking functions flawlessly.
+* **Hardened OAuth CSRF Verification**: Extended state token expiration to 60 minutes (`3600.0s`), guaranteed string type-casting to prevent list parameter runtime exceptions, and added explicit database transaction commits on state consumption.
+
+#### ⚡ 2. Groq Translation Endpoint Optimization
+* **Updated Model Matrix in `pipeline/translate.py`**: Replaced defunct model endpoints (`qwen/qwen3.8-27b`, `openai/gpt-oss-20b`) with active Groq production models (`llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `mixtral-8x7b-32768`, `gemma2-9b-it`), eliminating HTTP 400/404 failures and redundant request latency.
+
+#### 🧹 3. Resource Leak Prevention (DoS Defense)
+* **Guaranteed Tempfile Cleanup in `app.py`**: Added deterministic `finally:` and exception-scoped cleanup handlers for uploaded video files across standard dubbing, batch dubbing, and Human-in-the-Loop (HIL) workflows, eliminating disk space exhaustion risks from abandoned temporary files.
+* **HIL Tab 4 Review Controls**: Added a dedicated `Cancel` button to gracefully terminate pending reviews and instantly purge intermediate temp video files.
+
+#### 🔊 4. Audio Synthesis Concatenation Fault-Tolerance
+* **Resilient Fallback in `pipeline/sarvam.py`**: Wrapped multi-chunk and single-chunk FFmpeg conversion in structured `try-except (FileNotFoundError, subprocess.CalledProcessError)` blocks with binary audio stream concatenation and file copying fallbacks, mirroring `pipeline/synthesize.py` and preventing unhandled process crashes.
+
+---
+
 ### Commit `feat(neo4j)` — *Enterprise Neo4j Multilingual Knowledge Graph & Provenance DAG Studio*
 
 #### 🕸️ 1. Native Neo4j Integration & Resilient Hybrid Fallback

@@ -344,7 +344,7 @@ def register_user(
                 if cur.fetchone():
                     return False, f"An account with email '{email}' already exists. Please sign in instead."
 
-            conn.execute(
+            cur.execute(
                 """
                 INSERT INTO users (username, password_hash, salt, email, name, role, auth_provider)
                 VALUES (?, ?, ?, ?, ?, ?, 'local');
@@ -495,12 +495,13 @@ def create_oauth_state() -> str:
         pass
 
     state = secrets.token_urlsafe(32)
-    expires_at = now + 1800.0  # 30-minute validity window
+    expires_at = now + 3600.0  # 60-minute validity window
     try:
         with _get_db() as conn:
             # Purge expired tokens using numeric epoch comparison
             conn.execute("DELETE FROM oauth_states WHERE expires_at IS NOT NULL AND expires_at < ?;", (now,))
             conn.execute("INSERT OR REPLACE INTO oauth_states (state, expires_at) VALUES (?, ?);", (state, expires_at))
+            conn.commit()
     except Exception as e:
         log.warning(f"Error persisting oauth state in db: {e}")
 
@@ -518,6 +519,12 @@ def verify_and_consume_oauth_state(state: str) -> bool:
     """Verify that an OAuth state token exists, is unexpired, and consume it immediately."""
     if not state:
         return False
+    if isinstance(state, list):
+        state = state[0] if state else ""
+    state = str(state).strip()
+    if not state:
+        return False
+
     now = time.time()
     verified = False
 
@@ -542,7 +549,8 @@ def verify_and_consume_oauth_state(state: str) -> bool:
                 exp = row["expires_at"] if "expires_at" in row.keys() else None
                 if exp is None or exp >= now:
                     verified = True
-                conn.execute("DELETE FROM oauth_states WHERE state = ?;", (state,))
+                cur.execute("DELETE FROM oauth_states WHERE state = ?;", (state,))
+                conn.commit()
     except Exception as e:
         log.warning(f"Error querying oauth_states in db: {e}")
 
@@ -666,7 +674,7 @@ def _upsert_google_user(
             else:
                 username = base_user
 
-            conn.execute(
+            cur.execute(
                 """
                 INSERT INTO users (username, password_hash, salt, email, name, avatar_url, google_id, auth_provider, role, last_login)
                 VALUES (?, 'GOOGLE_AUTH', 'GOOGLE_SALT', ?, ?, ?, ?, 'google', ?, ?);
@@ -899,6 +907,7 @@ def render_login_page() -> None:
                     st.rerun()
                 else:
                     st.error(f"Google Authentication Error: {err}")
+                    st.info("💡 If your session expired or you reloaded the browser, click 'Continue with Google' again to start a fresh sign-in session.")
 
     # Check for session expiration notice
     if st.session_state.get("session_expired_msg"):
