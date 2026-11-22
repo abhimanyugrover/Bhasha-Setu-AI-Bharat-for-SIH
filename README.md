@@ -230,6 +230,28 @@ Access the studio at `http://localhost:8501`.
 
 ## 📜 Commit History & Release Notes
 
+### Commit `9c77252` — *Fix: Google OAuth CSRF State Verification & Dark Mode UI Contrast*
+
+#### 🔐 1. Google OAuth 2.0 Anti-CSRF Token Security
+* **Epoch-Based Token Expiration**: Migrated the SQLite `oauth_states` schema to numeric Unix timestamps (`expires_at REAL = time.time() + 1800`), completely resolving timezone mismatches between UTC `CURRENT_TIMESTAMP` and local system time that previously caused single-use tokens to be pruned prematurely.
+* **Dual-Layer State Verification**: Implemented verification against both persistent SQLite storage and in-memory `st.session_state` using constant-time cryptographic digest comparison (`secrets.compare_digest`).
+* **Multi-Tab Collision Defense**: Added active state caching (`_active_oauth_state`) so all Google Sign-In triggers (Quick Sign-In and Dedicated Google ID tab) share the same validated state token without generating competing or conflicting states.
+* **Double-Submission Guard**: Added `_processed_oauth_code` protection so immediate Streamlit re-executions upon callback don't trigger false CSRF warnings.
+
+#### 🎨 2. Dark & Light Theme Contrast Optimization
+* **BaseWeb Selectbox & Input Capsules**: Overhauled CSS targeting for BaseWeb dropdowns and text inputs (`[data-baseweb="select"] > div`, `[data-baseweb="base-input"] > input`) with solid `#131C2E` background in Dark Mode, eliminating unstyled bright white boxes and unreadable white-on-white text.
+* **Streamlit Configuration**: Set default theme parameters in `.streamlit/config.toml` (`base = "dark"`, `backgroundColor = "#080B14"`, `secondaryBackgroundColor = "#121A2D"`) to ensure component initialization defaults match our design system.
+* **Language Grid Unpack**: Verified clean unpacking in the 12+ official Indic languages grid (`for col, (l_name, l_native, l_col, l_code, l_reg, l_spk) in zip(i_cols, r_langs):`).
+
+---
+
+### Commit `192d258` — *Documentation: Comprehensive Platform Architecture, Guides & Specifications*
+* Added complete pipeline architecture documentation, dataflow diagrams, and AWS/Sarvam AI technical specifications.
+* Documented step-by-step setup guide for API credentials, Google Cloud OAuth configuration, and deployment instructions.
+* Added detailed release notes and changelog covering enterprise security, concurrency controls, and design system updates.
+
+---
+
 ### Commit `72c54b4` — *Production Release: Modern Capsule UI, Figma Light Mode, Sarvam AI & Security Architecture*
 
 #### 🎨 1. Figma & Snitch-Inspired Capsule Design System
