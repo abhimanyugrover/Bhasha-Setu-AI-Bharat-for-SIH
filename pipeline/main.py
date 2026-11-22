@@ -11,6 +11,7 @@ KEY FIXES:
 """
 
 import os
+import re
 import uuid
 import logging
 import logging.handlers
@@ -19,17 +20,33 @@ from pipeline.config import (
     OUTPUT_DIR, LOG_DIR, LANGUAGES,
     SOURCE_LANGUAGES, TRANSCRIBE_TO_TRANSLATE_CODE,
 )
-from pipeline.storage    import upload_to_s3
+from pipeline.storage    import upload_to_s3, delete_from_s3
 from pipeline.transcribe import transcribe_video
 from pipeline.translate  import translate_text, polish_translation_with_llm
 from pipeline.synthesize import synthesize_speech
 from pipeline.mux        import mux
+from pipeline.concurrency import acquire_dubbing_slot
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,    exist_ok=True)
 
 
 from typing import Optional
+
+def _safe_cleanup_temp(temp_path: str):
+    """Safely delete downloaded temp files and folders without risking system temp dirs."""
+    if not temp_path or not os.path.exists(temp_path):
+        return
+    try:
+        parent = os.path.dirname(os.path.abspath(temp_path))
+        parent_name = os.path.basename(parent)
+        if parent_name.startswith("bhasha_setu_") and os.path.isdir(parent):
+            import shutil
+            shutil.rmtree(parent, ignore_errors=True)
+        elif os.path.isfile(temp_path):
+            os.remove(temp_path)
+    except Exception as e:
+        log.warning(f"Failed to cleanup temp file {temp_path}: {e}")
 
 def _setup_logging():
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -75,6 +92,9 @@ def run_transcribe_and_translate(
     video_url:           str  = "",
     words_per_subtitle:  int  = 8,
     source_language:     str  = "Auto-detect",
+    translate_engine:    str  = "auto",
+    tts_engine:          str  = "auto",
+    sarvam_speaker:      str  = "meera",
 ) -> dict:
     """
     Phase 1 of the pipeline for human-in-the-loop review:
@@ -108,101 +128,114 @@ def run_transcribe_and_translate(
             try: progress_cb(stage, pct, msg)
             except Exception: pass
 
-    # Stage 1: Fetch (URL) or Upload
-    if _url_mode:
-        _prog(1, 5, "Connecting to video source…")
-        def _dl_prog(pct: float, msg: str):
-            _prog(1, 5 + pct * 0.6, msg)
-        from pipeline.downloader import download_to_temp
-        video_path   = download_to_temp(video_url, progress_cb=_dl_prog)
-        _temp_to_del = video_path
-        _prog(1, 70, "Uploading to S3…")
-    else:
-        _prog(1, 10, "Connecting to S3…")
-        _prog(1, 40, f"Uploading {os.path.basename(video_path)}…")
+    with acquire_dubbing_slot(job_id=job_id, status_cb=lambda m: _prog(1, 0, m)):
+        # Stage 1: Fetch (URL) or Upload
+        if _url_mode:
+            _prog(1, 5, "Connecting to video source…")
+            def _dl_prog(pct: float, msg: str):
+                _prog(1, 5 + pct * 0.6, msg)
+            from pipeline.downloader import download_to_temp
+            video_path   = download_to_temp(video_url, progress_cb=_dl_prog)
+            _temp_to_del = video_path
+            _prog(1, 70, "Uploading to S3…")
+        else:
+            _prog(1, 10, "Connecting to S3…")
+            _prog(1, 40, f"Uploading {os.path.basename(video_path)}…")
 
-    s3_key = f"inputs/{job_id}_{os.path.basename(video_path)}"
-    s3_uri = upload_to_s3(video_path, s3_key)
-    _prog(1, 100, f"Uploaded → {s3_uri}")
+        clean_base = re.sub(r"[^a-zA-Z0-9._-]", "_", os.path.basename(video_path.replace("\\", "/")))
+        s3_key = f"inputs/{job_id}_{clean_base}"
+        s3_uri = upload_to_s3(video_path, s3_key)
+        _prog(1, 100, f"Uploaded → {s3_uri}")
 
-    # Stage 2: Transcribe (any language)
-    lang_note = f"({source_language})" if source_language != "Auto-detect" else "(auto-detect)"
-    _prog(2, 5, f"Starting transcription job… {lang_note}")
+        try:
+            # Stage 2: Transcribe (any language)
+            lang_note = f"({source_language})" if source_language != "Auto-detect" else "(auto-detect)"
+            _prog(2, 5, f"Starting transcription job… {lang_note}")
 
-    def transcribe_progress(elapsed_pct: float, status: str):
-        _prog(2, min(95, elapsed_pct), f"AWS Transcribe: {status}")
+            def transcribe_progress(elapsed_pct: float, status: str):
+                _prog(2, min(95, elapsed_pct), f"AWS Transcribe: {status}")
 
-    transcript, word_timestamps, detected_tc = transcribe_video(
-        s3_uri,
-        progress_cb=transcribe_progress,
-        return_timestamps=generate_srt,
-        source_language_code=src_tc,
-    )
-    _prog(2, 100, f"Transcript ready ({len(transcript)} chars) — detected: {detected_tc}")
+            transcript, word_timestamps, detected_tc = transcribe_video(
+                s3_uri,
+                progress_cb=transcribe_progress,
+                return_timestamps=generate_srt,
+                source_language_code=src_tc,
+            )
+            _prog(2, 100, f"Transcript ready ({len(transcript or '')} chars) — detected: {detected_tc}")
+        finally:
+            # Remove video from S3 as soon as Transcribe has ingested it
+            delete_from_s3(s3_key)
 
-    # KEY FIX: Removed English-only guard. Any language is valid.
-    if not transcript or not transcript.strip():
-        raise ValueError(
-            "No speech detected in this video.\n\n"
-            "Possible reasons:\n"
-            "• The video has background music but no spoken words\n"
-            "• The audio is too quiet or muffled\n"
-            "• The video has no audio track\n\n"
-            "Please use a video with clear spoken speech."
+        # KEY FIX: Removed English-only guard. Any language is valid.
+        if not transcript or not transcript.strip():
+            raise ValueError(
+                "No speech detected in this video.\n\n"
+                "Possible reasons:\n"
+                "• The video has background music but no spoken words\n"
+                "• The audio is too quiet or muffled\n"
+                "• The video has no audio track\n\n"
+                "Please use a video with clear spoken speech."
+            )
+
+        # Resolve source translate code from detected Transcribe language
+        detected_translate_code = TRANSCRIBE_TO_TRANSLATE_CODE.get(detected_tc, "en")
+        log.info(f"Transcribe lang: {detected_tc} → Translate source: {detected_translate_code}")
+
+        # Stage 3: Translate (any → any)
+        _prog(3, 5, f"Translating {detected_translate_code} → {lang_code}…")
+
+        def translate_progress(chunk_i: int, total_chunks: int):
+            pct = 10 + (chunk_i / max(1, total_chunks)) * 75
+            _prog(3, pct, f"Translating chunk {chunk_i}/{total_chunks}…")
+
+        translation = translate_text(
+            transcript,
+            target_lang_code=lang_code,
+            source_lang_code=detected_translate_code,   # KEY FIX: was always "en"
+            progress_cb=translate_progress,
+            translate_engine=translate_engine,
         )
 
-    # Resolve source translate code from detected Transcribe language
-    detected_translate_code = TRANSCRIBE_TO_TRANSLATE_CODE.get(detected_tc, "en")
-    log.info(f"Transcribe lang: {detected_tc} → Translate source: {detected_translate_code}")
+        if not translation:
+            log.warning("Translation result was empty or None; defaulting to transcript.")
+            translation = transcript
 
-    # Stage 3: Translate (any → any)
-    _prog(3, 5, f"Translating {detected_translate_code} → {lang_code}…")
+        if polish_translation:
+            _prog(3, 90, "LLM polishing translation…")
+            try:
+                polished = polish_translation_with_llm(
+                    translation, target_language, transcript,
+                    source_language=source_language or "the source language",
+                )
+                if polished:
+                    translation = polished
+                _prog(3, 100, "Translation polished")
+            except Exception as e:
+                log.warning(f"LLM polish failed (non-fatal): {e}")
+                _prog(3, 100, "Translation complete (polish skipped)")
+        else:
+            _prog(3, 100, f"Translation ready ({len(translation or '')} chars)")
 
-    def translate_progress(chunk_i: int, total_chunks: int):
-        pct = 10 + (chunk_i / max(1, total_chunks)) * 75
-        _prog(3, pct, f"Translating chunk {chunk_i}/{total_chunks}…")
+        srt_path = ""
+        if generate_srt and word_timestamps:
+            try:
+                from pipeline.transcribe import generate_srt_file
+                srt_path = os.path.join(OUTPUT_DIR, f"{job_id}_subtitles.srt")
+                generate_srt_file(word_timestamps, srt_path, words_per_subtitle=words_per_subtitle)
+            except Exception as e:
+                log.warning(f"SRT generation failed (non-fatal): {e}")
 
-    translation = translate_text(
-        transcript,
-        target_lang_code=lang_code,
-        source_lang_code=detected_translate_code,   # KEY FIX: was always "en"
-        progress_cb=translate_progress,
-    )
-
-    if polish_translation:
-        _prog(3, 90, "LLM polishing translation…")
-        try:
-            translation = polish_translation_with_llm(
-                translation, target_language, transcript,
-                source_language=source_language or "the source language",
-            )
-            _prog(3, 100, "Translation polished")
-        except Exception as e:
-            log.warning(f"LLM polish failed (non-fatal): {e}")
-            _prog(3, 100, "Translation complete (polish skipped)")
-    else:
-        _prog(3, 100, f"Translation ready ({len(translation)} chars)")
-
-    srt_path = ""
-    if generate_srt and word_timestamps:
-        try:
-            from pipeline.transcribe import generate_srt_file
-            srt_path = os.path.join(OUTPUT_DIR, f"{job_id}_subtitles.srt")
-            generate_srt_file(word_timestamps, srt_path, words_per_subtitle=words_per_subtitle)
-        except Exception as e:
-            log.warning(f"SRT generation failed (non-fatal): {e}")
-
-    return {
-        "job_id":                  job_id,
-        "video_path":              video_path,
-        "language":                target_language,
-        "source_language":         source_language,
-        "detected_language_code":  detected_tc,
-        "transcript":              transcript,
-        "translation":             translation,
-        "srt_path":                srt_path,
-        "_temp_path":              _temp_to_del,
-    }
+        return {
+            "job_id":                  job_id,
+            "video_path":              video_path,
+            "language":                target_language,
+            "source_language":         source_language,
+            "detected_language_code":  detected_tc,
+            "transcript":              transcript,
+            "translation":             translation,
+            "srt_path":                srt_path,
+            "_temp_path":              _temp_to_del,
+        }
 
 
 def run_tts_and_mux(
@@ -215,6 +248,8 @@ def run_tts_and_mux(
     voice_pitch:     int = 0,
     vol_boost:       float = 2.0,
     bg_music_vol:    float = 0.0,
+    tts_engine:      str = "auto",
+    sarvam_speaker:  str = "meera",
 ) -> dict:
     """
     Phase 2 of the pipeline for human-in-the-loop:
@@ -239,41 +274,44 @@ def run_tts_and_mux(
             try: progress_cb(stage, pct, msg)
             except Exception: pass
 
-    # Stage 4: Synthesize
-    _prog(4, 5, f"Initializing {lang_cfg['tts'].upper()} engine…")
+    with acquire_dubbing_slot(job_id=job_id, status_cb=lambda m: _prog(4, 0, m)):
+        # Stage 4: Synthesize
+        _prog(4, 5, f"Initializing {lang_cfg['tts'].upper()} engine…")
 
-    def synth_progress(chunk_i: int, total_chunks: int):
-        pct = 10 + (chunk_i / max(1, total_chunks)) * 85
-        _prog(4, pct, f"Synthesizing chunk {chunk_i}/{total_chunks}…")
+        def synth_progress(chunk_i: int, total_chunks: int):
+            pct = 10 + (chunk_i / max(1, total_chunks)) * 85
+            _prog(4, pct, f"Synthesizing chunk {chunk_i}/{total_chunks}…")
 
-    mp3_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp3")
-    synthesize_speech(
-        final_text, mp3_path, target_language,
-        progress_cb=synth_progress, pitch_percent=voice_pitch,
-    )
-    _prog(4, 100, f"Audio synthesized")
+        mp3_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp3")
+        try:
+            synthesize_speech(
+                final_text, mp3_path, target_language,
+                progress_cb=synth_progress, pitch_percent=voice_pitch,
+                tts_engine=tts_engine, sarvam_speaker=sarvam_speaker,
+            )
+            _prog(4, 100, f"Audio synthesized")
 
-    # Stage 5: Mux
-    _prog(5, 10, "Converting MP3 → WAV and muxing…")
+            # Stage 5: Mux
+            _prog(5, 10, "Converting MP3 → WAV and muxing…")
 
-    def mux_progress(step_pct: float, msg: str):
-        _prog(5, step_pct, msg)
+            def mux_progress(step_pct: float, msg: str):
+                _prog(5, step_pct, msg)
 
-    output_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp4")
-    mux(video_path, mp3_path, output_path,
-        progress_cb=mux_progress, vol_boost=vol_boost, bg_music_vol=bg_music_vol)
-    _prog(5, 100, f"Mux complete → {os.path.basename(output_path)}")
+            output_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp4")
+            mux(video_path, mp3_path, output_path,
+                progress_cb=mux_progress, vol_boost=vol_boost, bg_music_vol=bg_music_vol)
+            _prog(5, 100, f"Mux complete → {os.path.basename(output_path)}")
+        finally:
+            try: os.remove(mp3_path)
+            except Exception: pass
 
-    try: os.remove(mp3_path)
-    except Exception: pass
-
-    return {
-        "job_id":      job_id,
-        "output_path": output_path,
-        "language":    target_language,
-        "translation": final_text,
-        "srt_path":    srt_path,
-    }
+        return {
+            "job_id":      job_id,
+            "output_path": output_path,
+            "language":    target_language,
+            "translation": final_text,
+            "srt_path":    srt_path,
+        }
 
 
 def run_pipeline(
@@ -288,6 +326,9 @@ def run_pipeline(
     bg_music_vol:        float = 0.0,
     words_per_subtitle:  int   = 8,
     source_language:     Optional[str] = "Auto-detect",
+    translate_engine:    str   = "auto",
+    tts_engine:          str   = "auto",
+    sarvam_speaker:      str   = "meera",
 ) -> dict:
     """
     Run the full Bhasha-Setu any-to-any dubbing pipeline.
@@ -334,124 +375,135 @@ def run_pipeline(
             try: progress_cb(stage, pct, msg)
             except Exception: pass
 
-    # Stage 1: Fetch + Upload
-    if _url_mode:
-        _prog(1, 5, "Connecting to video source…")
-        def _dl_prog(pct: float, msg: str):
-            _prog(1, 5 + pct * 0.60, msg)
-        from pipeline.downloader import download_to_temp
-        video_path   = download_to_temp(video_url, progress_cb=_dl_prog)
-        _temp_to_del = video_path
-        _prog(1, 70, "Uploading to S3…")
-    else:
-        _prog(1, 10, "Connecting to S3…")
-        _prog(1, 40, f"Uploading {os.path.basename(video_path)}…")
-
-    s3_key = f"inputs/{job_id}_{os.path.basename(video_path)}"
-    s3_uri = upload_to_s3(video_path, s3_key)
-    _prog(1, 100, f"Uploaded → {s3_uri}")
-
-    # Stage 2: Transcribe (any language)
-    lang_note = f"({source_language})" if source_language != "Auto-detect" else "(auto-detect)"
-    _prog(2, 5, f"Starting transcription… {lang_note}")
-
-    def transcribe_progress(elapsed_pct: float, status: str):
-        _prog(2, min(95, elapsed_pct), f"AWS Transcribe: {status}")
-
-    transcript, word_timestamps, detected_tc = transcribe_video(
-        s3_uri,
-        progress_cb=transcribe_progress,
-        return_timestamps=generate_srt,
-        source_language_code=src_tc,
-    )
-    _prog(2, 100, f"Transcript ready ({len(transcript)} chars) — detected: {detected_tc}")
-
-    if not transcript or not transcript.strip():
-        raise ValueError(
-            "No speech detected in this video.\n\n"
-            "Possible reasons:\n"
-            "• The video has background music but no spoken words\n"
-            "• The audio is too quiet or muffled\n\n"
-            "Please use a video with clear spoken speech."
-        )
-
-    # Resolve translate source code
-    detected_translate_code = TRANSCRIBE_TO_TRANSLATE_CODE.get(detected_tc, "en")
-
-    # Stage 3: Translate (any → any)
-    _prog(3, 5, f"Translating {detected_translate_code} → {lang_code}…")
-
-    def translate_progress(chunk_i: int, total_chunks: int):
-        pct = 10 + (chunk_i / max(1, total_chunks)) * 75
-        _prog(3, pct, f"Translating chunk {chunk_i}/{total_chunks}…")
-
-    translation = translate_text(
-        transcript,
-        target_lang_code=lang_code,
-        source_lang_code=detected_translate_code,   # KEY FIX
-        progress_cb=translate_progress,
-    )
-
-    if polish_translation:
-        _prog(3, 90, "LLM polishing translation…")
-        try:
-            translation = polish_translation_with_llm(
-                translation, target_language, transcript,
-                source_language=source_language or "source",
-            )
-            _prog(3, 100, "Translation polished")
-        except Exception as e:
-            log.warning(f"LLM polish failed: {e}")
-            _prog(3, 100, "Translation complete (polish skipped)")
-    else:
-        _prog(3, 100, f"Translation ready ({len(translation)} chars)")
-
-    srt_path = ""
-    if generate_srt and word_timestamps:
-        try:
-            from pipeline.transcribe import generate_srt_file
-            srt_path = os.path.join(OUTPUT_DIR, f"{job_id}_subtitles.srt")
-            generate_srt_file(word_timestamps, srt_path, words_per_subtitle=words_per_subtitle)
-        except Exception as e:
-            log.warning(f"SRT generation failed: {e}")
-
+    s3_key = ""
     try:
-        # Stage 4: Synthesize
-        _prog(4, 5, f"Initializing {lang_cfg['tts'].upper()} engine…")
+        with acquire_dubbing_slot(job_id=job_id, status_cb=lambda m: _prog(1, 0, m)):
+            # Stage 1: Fetch + Upload
+            if _url_mode:
+                _prog(1, 5, "Connecting to video source…")
+                def _dl_prog(pct: float, msg: str):
+                    _prog(1, 5 + pct * 0.60, msg)
+                from pipeline.downloader import download_to_temp
+                video_path   = download_to_temp(video_url, progress_cb=_dl_prog)
+                _temp_to_del = video_path
+                _prog(1, 70, "Uploading to S3…")
+            else:
+                _prog(1, 10, "Connecting to S3…")
+                _prog(1, 40, f"Uploading {os.path.basename(video_path)}…")
 
-        def synth_progress(chunk_i: int, total_chunks: int):
-            pct = 10 + (chunk_i / max(1, total_chunks)) * 85
-            _prog(4, pct, f"Synthesizing chunk {chunk_i}/{total_chunks}…")
+            clean_base = re.sub(r"[^a-zA-Z0-9._-]", "_", os.path.basename(video_path.replace("\\", "/")))
+            s3_key = f"inputs/{job_id}_{clean_base}"
+            s3_uri = upload_to_s3(video_path, s3_key)
+            _prog(1, 100, f"Uploaded → {s3_uri}")
 
-        mp3_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp3")
-        synthesize_speech(
-            translation, mp3_path, target_language,
-            progress_cb=synth_progress, pitch_percent=voice_pitch,
-        )
-        _prog(4, 100, "Audio synthesized")
-
-        # Stage 5: Mux
-        _prog(5, 10, "Converting MP3 → WAV…")
-
-        def mux_progress(step_pct: float, msg: str):
-            _prog(5, step_pct, msg)
-
-        output_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp4")
-        mux(video_path, mp3_path, output_path,
-            progress_cb=mux_progress, vol_boost=vol_boost, bg_music_vol=bg_music_vol)
-        _prog(5, 100, f"Mux complete → {os.path.basename(output_path)}")
-
-        try: os.remove(mp3_path)
-        except Exception: pass
-    finally:
-        if _temp_to_del and os.path.exists(_temp_to_del):
             try:
-                import shutil
-                parent = os.path.dirname(_temp_to_del)
-                if parent and os.path.isdir(parent):
-                    shutil.rmtree(parent, ignore_errors=True)
-            except Exception:
-                pass
+                # Stage 2: Transcribe (any language)
+                lang_note = f"({source_language})" if source_language != "Auto-detect" else "(auto-detect)"
+                _prog(2, 5, f"Starting transcription… {lang_note}")
+
+                def transcribe_progress(elapsed_pct: float, status: str):
+                    _prog(2, min(95, elapsed_pct), f"AWS Transcribe: {status}")
+
+                transcript, word_timestamps, detected_tc = transcribe_video(
+                    s3_uri,
+                    progress_cb=transcribe_progress,
+                    return_timestamps=generate_srt,
+                    source_language_code=src_tc,
+                )
+                _prog(2, 100, f"Transcript ready ({len(transcript or '')} chars) — detected: {detected_tc}")
+            finally:
+                # Delete staging video from S3 once transcription is complete or if it failed
+                if s3_key:
+                    delete_from_s3(s3_key)
+
+            if not transcript or not transcript.strip():
+                raise ValueError(
+                    "No speech detected in this video.\n\n"
+                    "Possible reasons:\n"
+                    "• The video has background music but no spoken words\n"
+                    "• The audio is too quiet or muffled\n\n"
+                    "Please use a video with clear spoken speech."
+                )
+
+            # Resolve translate source code
+            detected_translate_code = TRANSCRIBE_TO_TRANSLATE_CODE.get(detected_tc, "en")
+
+            # Stage 3: Translate (any → any)
+            _prog(3, 5, f"Translating {detected_translate_code} → {lang_code}…")
+
+            def translate_progress(chunk_i: int, total_chunks: int):
+                pct = 10 + (chunk_i / max(1, total_chunks)) * 75
+                _prog(3, pct, f"Translating chunk {chunk_i}/{total_chunks}…")
+
+            translation = translate_text(
+                transcript,
+                target_lang_code=lang_code,
+                source_lang_code=detected_translate_code,   # KEY FIX
+                progress_cb=translate_progress,
+                translate_engine=translate_engine,
+            )
+
+            if not translation:
+                log.warning("Translation result was empty or None; defaulting to transcript.")
+                translation = transcript
+
+            if polish_translation:
+                _prog(3, 90, "LLM polishing translation…")
+                try:
+                    polished = polish_translation_with_llm(
+                        translation, target_language, transcript,
+                        source_language=source_language or "source",
+                    )
+                    if polished:
+                        translation = polished
+                    _prog(3, 100, "Translation polished")
+                except Exception as e:
+                    log.warning(f"LLM polish failed: {e}")
+                    _prog(3, 100, "Translation complete (polish skipped)")
+            else:
+                _prog(3, 100, f"Translation ready ({len(translation or '')} chars)")
+
+            srt_path = ""
+            if generate_srt and word_timestamps:
+                try:
+                    from pipeline.transcribe import generate_srt_file
+                    srt_path = os.path.join(OUTPUT_DIR, f"{job_id}_subtitles.srt")
+                    generate_srt_file(word_timestamps, srt_path, words_per_subtitle=words_per_subtitle)
+                except Exception as e:
+                    log.warning(f"SRT generation failed: {e}")
+
+            # Stage 4: Synthesize
+            _prog(4, 5, f"Initializing {lang_cfg['tts'].upper()} engine…")
+
+            def synth_progress(chunk_i: int, total_chunks: int):
+                pct = 10 + (chunk_i / max(1, total_chunks)) * 85
+                _prog(4, pct, f"Synthesizing chunk {chunk_i}/{total_chunks}…")
+
+            mp3_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp3")
+            try:
+                synthesize_speech(
+                    translation, mp3_path, target_language,
+                    progress_cb=synth_progress, pitch_percent=voice_pitch,
+                    tts_engine=tts_engine, sarvam_speaker=sarvam_speaker,
+                )
+                _prog(4, 100, "Audio synthesized")
+
+                # Stage 5: Mux
+                _prog(5, 10, "Converting MP3 → WAV…")
+
+                def mux_progress(step_pct: float, msg: str):
+                    _prog(5, step_pct, msg)
+
+                output_path = os.path.join(OUTPUT_DIR, f"{job_id}_dubbed.mp4")
+                mux(video_path, mp3_path, output_path,
+                    progress_cb=mux_progress, vol_boost=vol_boost, bg_music_vol=bg_music_vol)
+                _prog(5, 100, f"Mux complete → {os.path.basename(output_path)}")
+            finally:
+                if os.path.exists(mp3_path):
+                    try: os.remove(mp3_path)
+                    except Exception: pass
+    finally:
+        _safe_cleanup_temp(_temp_to_del)
 
     log.info(f"=== JOB {job_id} COMPLETE === Output: {output_path}")
     return {

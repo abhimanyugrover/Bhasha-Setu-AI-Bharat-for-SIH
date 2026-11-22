@@ -11,6 +11,9 @@ import os
 AWS_REGION     = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
 S3_BUCKET      = os.environ.get("S3_BUCKET",          "bhasha-setu-videos")
 
+# ── Sarvam AI ─────────────────────────────────────────────────────────────────
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
+
 # ── Directories ───────────────────────────────────────────────────────────────
 OUTPUT_DIR = "output"
 CACHE_DIR  = "cache"

@@ -15,11 +15,60 @@ Public API:
 import os
 import tempfile
 import logging
+import ipaddress
+import socket
+import urllib.parse
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
 MAX_HEIGHT = 720
+
+def validate_video_url(url: str) -> str:
+    """
+    Validate that the URL is a safe, publicly reachable HTTP/HTTPS URL.
+    Blocks private networks, loopback, link-local, cloud metadata, and dangerous schemes (SSRF protection).
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("URL must be a non-empty string.")
+
+    url = url.strip()
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as e:
+        raise ValueError(f"Malformed URL: {e}")
+
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError(f"Disallowed URL scheme '{parsed.scheme}'. Only HTTP and HTTPS are permitted.")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must have a valid hostname.")
+
+    disallowed_hosts = {
+        "localhost", "127.0.0.1", "::1", "0.0.0.0",
+        "169.254.169.254", "metadata.google.internal", "instance-data"
+    }
+    if hostname.lower() in disallowed_hosts:
+        raise ValueError(f"Access to '{hostname}' is not permitted.")
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve hostname '{hostname}': {e}")
+
+    for entry in addr_info:
+        ip_str = entry[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                raise ValueError(f"URL resolves to disallowed private/internal IP address: {ip_str}")
+        except ValueError as e:
+            if "disallowed private/internal IP" in str(e):
+                raise
+            pass
+
+    return url
 
 _PLATFORM_MAP = {
     "youtube":     "YouTube",
@@ -70,33 +119,16 @@ def _friendly_error(e) -> str:
 
 
 def _make_opts(extra: dict = None) -> dict:
-    """Base yt-dlp options shared by all calls."""
+    """Base yt-dlp options shared by all calls with security defaults."""
     if extra is None: extra = {}
     return {
-        "quiet":       True,
-        "no_warnings": True,
-        "noplaylist":  True,
-        "http_headers": {"User-Agent": _UA},
+        "quiet":               True,
+        "no_warnings":         True,
+        "noplaylist":          True,
+        "http_headers":        {"User-Agent": _UA},
+        "no_check_certificate": False,
         **extra,
     }
-
-
-def _with_cookie_fallback(build_opts_fn, run_fn):
-    """
-    Try run_fn(opts_with_chrome_cookies), fall back to run_fn(opts_without_cookies)
-    if Chrome is not installed or cookies can't be read.
-    """
-    try:
-        opts = build_opts_fn(cookies=True)
-        return run_fn(opts)
-    except Exception as e:
-        err = str(e).lower()
-        # If the error is about cookies/browser, retry without them
-        if any(w in err for w in ("chrome", "cookie", "browser", "keyring")):
-            log.warning(f"Cookie read failed ({e}), retrying without cookies…")
-            opts = build_opts_fn(cookies=False)
-            return run_fn(opts)
-        raise
 
 
 # ── Public: metadata fetch ────────────────────────────────────────────────────
@@ -108,37 +140,29 @@ def get_video_info(url: str) -> dict:
     Returns dict: title, duration (seconds|None), thumbnail (url|None),
                   uploader (str|None), platform (str), url (str)
 
-    Raises ValueError for private/unavailable/bad URLs.
+    Raises ValueError for private/unavailable/bad URLs or SSRF attempts.
     Raises RuntimeError if yt-dlp is not installed.
     """
+    url = validate_video_url(url)
     try:
         import yt_dlp
     except ImportError:
         raise RuntimeError("yt-dlp not installed. Run: pip install yt-dlp")
 
-    def _build(cookies: bool):
-        o = _make_opts({"skip_download": True})
-        if cookies:
-            o["cookiesfrombrowser"] = ("chrome",)
-        return o
-
-    def _run(opts):
+    opts = _make_opts({"skip_download": True})
+    try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise ValueError("Could not fetch video information.")
-            return info
-
-    try:
-        info = _with_cookie_fallback(_build, _run)
-        return {
-            "title":     info.get("title", "Untitled Video"),
-            "duration":  info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "uploader":  info.get("uploader") or info.get("channel"),
-            "platform":  _platform(info),
-            "url":       url,
-        }
+            return {
+                "title":     info.get("title", "Untitled Video"),
+                "duration":  info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "uploader":  info.get("uploader") or info.get("channel"),
+                "platform":  _platform(info),
+                "url":       url,
+            }
     except yt_dlp.utils.DownloadError as e:
         raise ValueError(_friendly_error(e))
 
@@ -166,6 +190,7 @@ def download_to_temp(
         ValueError  : private / unavailable / bad URL
         RuntimeError: yt-dlp not installed, or unexpected failure
     """
+    url = validate_video_url(url)
     try:
         import yt_dlp
     except ImportError:
@@ -195,28 +220,21 @@ def download_to_temp(
             elif status == "finished":
                 progress_cb(97.0, "Merging audio & video streams…")
 
-        def _build(cookies: bool):
-            o = _make_opts({
-                "format":              _FORMAT,
-                "outtmpl":             out_tmpl,
-                "progress_hooks":      [_hook],
-                "merge_output_format": "mp4",
-                "retries":             5,
-                "fragment_retries":    5,
-            })
-            if cookies:
-                o["cookiesfrombrowser"] = ("chrome",)
-            return o
-
-        def _run(opts):
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=True)
+        opts = _make_opts({
+            "format":              _FORMAT,
+            "outtmpl":             out_tmpl,
+            "progress_hooks":      [_hook],
+            "merge_output_format": "mp4",
+            "retries":             5,
+            "fragment_retries":    5,
+        })
 
         try:
             if progress_cb:
                 progress_cb(0.0, "Connecting to video source…")
 
-            info = _with_cookie_fallback(_build, _run)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
             if not info:
                 raise ValueError("Download returned no information.")

@@ -13,6 +13,7 @@ hardcoded Hindi ("hi"), so a failed engine falls back in the same language.
 """
 
 import os
+import re
 import asyncio
 import logging
 import subprocess
@@ -35,6 +36,8 @@ log = logging.getLogger(__name__)
 
 def _chunk_text(text: str, max_chars: int) -> list:
     """Split text into chunks at sentence boundaries."""
+    if not text:
+        return [""]
     if len(text) <= max_chars:
         return [text]
 
@@ -69,7 +72,7 @@ def _concat_mp3_files(mp3_files: list, output_path: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         list_file = f.name
         for p in mp3_files:
-            abs_path = os.path.abspath(p).replace("\\", "/")
+            abs_path = os.path.abspath(p).replace("\\", "/").replace("'", "'\\''")
             f.write(f"file '{abs_path}'\n")
     try:
         subprocess.run([
@@ -85,17 +88,25 @@ def _concat_mp3_files(mp3_files: list, output_path: str) -> None:
                     out_f.write(in_f.read())
     finally:
         if os.path.exists(list_file):
-            os.unlink(list_file)
+            try:
+                os.unlink(list_file)
+            except Exception:
+                pass
 
 
 # ── POLLY ─────────────────────────────────────────────────────────────────────
 
 def _wrap_ssml(text: str, pitch_percent: int = 0, rate: str = "medium") -> str:
-    """Wrap text in SSML for pitch + rate control (Polly only)."""
-    sign       = "+" if pitch_percent > 0 else ""
-    pitch_attr = f' pitch="{sign}{pitch_percent}%"' if pitch_percent else ""
-    rate_attr  = f' rate="{rate}"'
-    return f'<speak><prosody{pitch_attr}{rate_attr}>{_xml_escape(text)}</prosody></speak>'
+    """Wrap text in SSML for pitch + rate control (Polly only) with entity and control char sanitization."""
+    clean_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    escaped_text = _xml_escape(clean_text, entities={'"': "&quot;", "'": "&apos;"})
+    safe_pitch = max(-20, min(20, int(pitch_percent)))
+    sign       = "+" if safe_pitch > 0 else ""
+    pitch_attr = f' pitch="{sign}{safe_pitch}%"' if safe_pitch else ""
+    allowed_rates = {"x-slow", "slow", "medium", "fast", "x-fast"}
+    safe_rate = rate if rate in allowed_rates else "medium"
+    rate_attr  = f' rate="{safe_rate}"'
+    return f'<speak><prosody{pitch_attr}{rate_attr}>{escaped_text}</prosody></speak>'
 
 
 def _synthesize_polly(
@@ -110,39 +121,44 @@ def _synthesize_polly(
     total       = len(chunks)
     chunk_files = []
 
-    for i, chunk in enumerate(chunks):
+    try:
+        for i, chunk in enumerate(chunks):
+            if progress_cb:
+                progress_cb(i, total)
+            tmp = os.path.splitext(output_mp3)[0] + f"_chunk{i}.mp3"
+
+            if pitch_percent:
+                ssml = _wrap_ssml(chunk, pitch_percent)
+                resp = client.synthesize_speech(
+                    Text=ssml, TextType="ssml",
+                    OutputFormat="mp3",
+                    VoiceId=lang_cfg["polly_voice"],
+                    Engine=lang_cfg["polly_engine"],
+                    LanguageCode=lang_cfg["polly_lang_code"],
+                )
+            else:
+                resp = client.synthesize_speech(
+                    Text=chunk, OutputFormat="mp3",
+                    VoiceId=lang_cfg["polly_voice"],
+                    Engine=lang_cfg["polly_engine"],
+                    LanguageCode=lang_cfg["polly_lang_code"],
+                )
+            with open(tmp, "wb") as f:
+                f.write(resp["AudioStream"].read())
+            chunk_files.append(tmp)
+
         if progress_cb:
-            progress_cb(i, total)
-        tmp = os.path.splitext(output_mp3)[0] + f"_chunk{i}.mp3"
+            progress_cb(total, total)
 
-        if pitch_percent:
-            ssml = _wrap_ssml(chunk, pitch_percent)
-            resp = client.synthesize_speech(
-                Text=ssml, TextType="ssml",
-                OutputFormat="mp3",
-                VoiceId=lang_cfg["polly_voice"],
-                Engine=lang_cfg["polly_engine"],
-                LanguageCode=lang_cfg["polly_lang_code"],
-            )
-        else:
-            resp = client.synthesize_speech(
-                Text=chunk, OutputFormat="mp3",
-                VoiceId=lang_cfg["polly_voice"],
-                Engine=lang_cfg["polly_engine"],
-                LanguageCode=lang_cfg["polly_lang_code"],
-            )
-        with open(tmp, "wb") as f:
-            f.write(resp["AudioStream"].read())
-        chunk_files.append(tmp)
-
-    if progress_cb:
-        progress_cb(total, total)
-
-    _concat_mp3_files(chunk_files, output_mp3)
-    for f in chunk_files:
-        try: os.remove(f)
-        except Exception: pass
-    return output_mp3
+        _concat_mp3_files(chunk_files, output_mp3)
+        return output_mp3
+    finally:
+        for f in chunk_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
 
 
 # ── EDGE-TTS ──────────────────────────────────────────────────────────────────
@@ -170,7 +186,7 @@ def _synthesize_edge(
     pitch_hz = _pitch_percent_to_hz(pitch_percent)
     chunks   = _chunk_text(text, EDGE_CHUNK_CHARS)
     total    = len(chunks)
-    log.info(f"edge-tts | voice={voice} | pitch={pitch_hz} | {total} chunk(s)")
+    log.info(f"edge-tts | voice={voice} | pitch={pitch_hz} | {total} chunk(s) (parallel mode)")
 
     try:
         loop = asyncio.get_event_loop()
@@ -181,25 +197,33 @@ def _synthesize_edge(
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     chunk_files = []
-
     try:
-        for i, chunk in enumerate(chunks):
+        async def _run_concurrent():
+            tasks = []
+            for i, chunk in enumerate(chunks):
+                tmp = os.path.splitext(output_mp3)[0] + f"_chunk{i}.mp3"
+                chunk_files.append(tmp)
+                tasks.append(_edge_tts_chunk_async(chunk, voice, tmp, pitch_hz))
+            await asyncio.gather(*tasks)
+
+        try:
             if progress_cb:
-                progress_cb(i, total)
-            tmp = os.path.splitext(output_mp3)[0] + f"_chunk{i}.mp3"
-            loop.run_until_complete(_edge_tts_chunk_async(chunk, voice, tmp, pitch_hz))
-            chunk_files.append(tmp)
+                progress_cb(0, total)
+            loop.run_until_complete(_run_concurrent())
+            if progress_cb:
+                progress_cb(total, total)
+        finally:
+            loop.close()
+
+        _concat_mp3_files(chunk_files, output_mp3)
+        return output_mp3
     finally:
-        loop.close()
-
-    if progress_cb:
-        progress_cb(total, total)
-
-    _concat_mp3_files(chunk_files, output_mp3)
-    for f in chunk_files:
-        try: os.remove(f)
-        except Exception: pass
-    return output_mp3
+        for f in chunk_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
 
 
 # ── GTTS ──────────────────────────────────────────────────────────────────────
@@ -224,21 +248,26 @@ def _synthesize_gtts(
     total       = len(chunks)
     chunk_files = []
 
-    for i, chunk in enumerate(chunks):
+    try:
+        for i, chunk in enumerate(chunks):
+            if progress_cb:
+                progress_cb(i, total)
+            tmp = os.path.splitext(output_mp3)[0] + f"_chunk{i}.mp3"
+            gTTS(text=chunk, lang=target_lang, slow=False).save(tmp)
+            chunk_files.append(tmp)
+
         if progress_cb:
-            progress_cb(i, total)
-        tmp = os.path.splitext(output_mp3)[0] + f"_chunk{i}.mp3"
-        gTTS(text=chunk, lang=target_lang, slow=False).save(tmp)
-        chunk_files.append(tmp)
+            progress_cb(total, total)
 
-    if progress_cb:
-        progress_cb(total, total)
-
-    _concat_mp3_files(chunk_files, output_mp3)
-    for f in chunk_files:
-        try: os.remove(f)
-        except Exception: pass
-    return output_mp3
+        _concat_mp3_files(chunk_files, output_mp3)
+        return output_mp3
+    finally:
+        for f in chunk_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
 
 
 # ── PUBLIC API ────────────────────────────────────────────────────────────────
@@ -249,16 +278,25 @@ def synthesize_speech(
     lang_name: str,
     progress_cb=None,
     pitch_percent: int = 0,
+    tts_engine: str = "auto",
+    sarvam_speaker: str = "priya",
 ) -> str:
     """
-    Synthesize speech for the given text and language.
+    Synthesize speech for the given text and language with multi-engine support:
+      - 'sarvam': Sarvam AI (Bulbul:v3) - Indic expressive neural voices
+      - 'edge': Microsoft Edge Neural
+      - 'polly': AWS Polly Neural
+      - 'gtts': Google TTS fallback
+      - 'auto': Uses Sarvam AI if available, else language default (Polly/Edge/gTTS)
 
     Args:
-        text:          Text to synthesize.
-        output_mp3:    Output MP3 file path.
-        lang_name:     Language name from LANGUAGES registry (e.g. "Hindi").
-        progress_cb:   Optional callable(chunk_index, total_chunks).
-        pitch_percent: Pitch offset percent (-20 to +20).
+        text:           Text to synthesize.
+        output_mp3:     Output MP3 file path.
+        lang_name:      Language name from LANGUAGES registry (e.g. "Hindi").
+        progress_cb:    Optional callable(chunk_index, total_chunks).
+        pitch_percent:  Pitch offset percent (-20 to +20).
+        tts_engine:     'auto', 'sarvam', 'edge', 'polly', or 'gtts'.
+        sarvam_speaker: Sarvam speaker name ('priya', 'aditya', 'ritu', etc.).
 
     Returns:
         output_mp3 path
@@ -266,8 +304,36 @@ def synthesize_speech(
     if not text or not text.strip():
         raise ValueError("TTS text is empty.")
 
+    if lang_name not in LANGUAGES:
+        raise ValueError(f"Unsupported language for synthesis: {lang_name}")
+
     lang_cfg = LANGUAGES[lang_name]
-    engine   = lang_cfg["tts"]
+
+    # Check for Sarvam AI engine request or auto-detection
+    from pipeline.sarvam import is_sarvam_available, synthesize_sarvam, SARVAM_LANGUAGES
+
+    use_sarvam = False
+    if tts_engine == "sarvam":
+        use_sarvam = True
+    elif tts_engine == "auto" and is_sarvam_available() and lang_name in SARVAM_LANGUAGES:
+        use_sarvam = True
+
+    if use_sarvam:
+        try:
+            log.info(f"Synthesizing with Sarvam AI Bulbul:v3 ({lang_name}, speaker={sarvam_speaker})")
+            return synthesize_sarvam(
+                text=text,
+                output_mp3=output_mp3,
+                lang_name=lang_name,
+                speaker=sarvam_speaker,
+                pitch=pitch_percent,
+                progress_cb=progress_cb,
+            )
+        except Exception as e:
+            log.warning(f"Sarvam AI TTS encountered an error: {e}. Gracefully falling back to native engine.")
+
+    # Native engine routing
+    engine = lang_cfg["tts"] if tts_engine in ("auto", "sarvam") else tts_engine
 
     try:
         if engine == "polly":
@@ -277,11 +343,9 @@ def synthesize_speech(
         elif engine == "gtts":
             return _synthesize_gtts(text, lang_cfg, output_mp3, progress_cb, pitch_percent)
         else:
-            raise ValueError(f"Unknown TTS engine: {engine!r}")
+            return _synthesize_edge(text, lang_cfg, output_mp3, progress_cb, pitch_percent)
 
     except Exception as e:
-        # FIX: was hardcoded {"gtts_lang": "hi"} — always fell back to Hindi voice.
-        # Now passes lang_cfg so the fallback uses the correct language.
         log.error(f"Engine '{engine}' failed for {lang_name}: {e}. Trying gTTS fallback.")
         try:
             return _synthesize_gtts(text, lang_cfg, output_mp3, None)

@@ -12,6 +12,7 @@ LLM POLISH: Uses Groq instead of AWS Bedrock — free, no card needed,
 import json
 import logging
 import os
+import requests
 from typing import Callable, Optional
 
 import boto3
@@ -19,11 +20,18 @@ from botocore.exceptions import ClientError
 from deep_translator import GoogleTranslator
 
 from pipeline.config import AWS_REGION, TRANSLATE_CHUNK_BYTES
+from pipeline.sarvam import is_sarvam_available, translate_sarvam, SARVAM_LANGUAGES
 
 log = logging.getLogger(__name__)
 
 # Languages AWS Translate / ap-south-1 doesn't reliably support as TARGET
 _GOOGLE_ONLY_TARGET_LANGS = {"or", "as"}
+
+ISO_TO_LANG_NAME = {
+    "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "kn": "Kannada",
+    "ml": "Malayalam", "bn": "Bengali", "mr": "Marathi", "gu": "Gujarati",
+    "pa": "Punjabi", "or": "Odia", "en": "English", "as": "Assamese", "ur": "Urdu",
+}
 
 
 def _get_secret(key: str) -> str:
@@ -43,6 +51,8 @@ def _split_into_chunks(text: str, max_bytes: int = TRANSLATE_CHUNK_BYTES) -> lis
     Split text on sentence boundaries, staying within max_bytes per chunk.
     Falls back to word-level splitting for very long sentences.
     """
+    if not text:
+        return []
     sentences = []
     buf = ""
     for char in text:
@@ -85,6 +95,7 @@ def translate_text(
     target_lang_code: str,
     source_lang_code: str = "en",
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    translate_engine: str = "auto",
 ) -> str:
     """
     Translate text from source language to target language.
@@ -95,6 +106,7 @@ def translate_text(
         source_lang_code: ISO code for source (e.g. 'en', 'hi', 'fr').
                           Defaults to 'en' for backward compatibility.
         progress_cb:      Optional callable(chunk_index, total_chunks).
+        translate_engine: 'auto', 'sarvam', 'aws', or 'google'.
 
     Returns:
         Translated text as a single string.
@@ -110,20 +122,38 @@ def translate_text(
         log.info("Source and target language are the same — skipping translation.")
         return text
 
-    # Google fallback for TARGET languages not well-supported by AWS ap-south-1
-    if tgt in _GOOGLE_ONLY_TARGET_LANGS:
-        log.info(f"Google Translator fallback for target '{tgt}'")
-        if progress_cb:
-            progress_cb(0, 1)
+    tgt_name = ISO_TO_LANG_NAME.get(tgt, "")
+    src_name = ISO_TO_LANG_NAME.get(src, "English")
+
+    # 1. SARVAM AI TRANSLATION (Mayura:v1) - State of the art Indic model
+    use_sarvam = (translate_engine == "sarvam") or (
+        translate_engine == "auto" and is_sarvam_available() and tgt_name in SARVAM_LANGUAGES
+    )
+    if use_sarvam and is_sarvam_available():
+        try:
+            log.info(f"Translating via Sarvam AI Mayura:v1: '{src}' -> '{tgt_name}'")
+            if progress_cb: progress_cb(0, 1)
+            result = translate_sarvam(text, source_lang_name=src_name, target_lang_name=tgt_name)
+            if result and result.strip():
+                if progress_cb: progress_cb(1, 1)
+                return result
+            log.warning("Sarvam translation returned empty/None; falling back to AWS/Google.")
+        except Exception as e:
+            log.warning(f"Sarvam translation failed ({e}), falling back to AWS/Google.")
+
+    # 2. GOOGLE TRANSLATOR (when requested or for targets not supported by AWS)
+    if translate_engine == "google" or tgt in _GOOGLE_ONLY_TARGET_LANGS:
+        log.info(f"Translating via Google Translator: '{src}' -> '{tgt}'")
+        if progress_cb: progress_cb(0, 1)
         chunks_text = _split_into_chunks(text, 4500)
         translated_chunks = []
         for chunk_text in chunks_text:
             translated_chunks.append(GoogleTranslator(source=src, target=tgt).translate(chunk_text))
         result = " ".join(translated_chunks)
-        if progress_cb:
-            progress_cb(1, 1)
-        return result
+        if progress_cb: progress_cb(1, 1)
+        return result or text
 
+    # 3. AWS TRANSLATE (Cloud) with fallback to Google Translator
     try:
         client = boto3.client("translate", region_name=AWS_REGION)
         chunks = _split_into_chunks(text)
@@ -145,19 +175,19 @@ def translate_text(
             progress_cb(total, total)
         return " ".join(translated_parts)
 
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-        if code in ("UnsupportedLanguagePairException", "UnsupportedLanguageException"):
-            log.warning(
-                f"AWS Translate doesn't support {src}->{tgt}. "
-                f"Falling back to Google Translator."
-            )
+    except Exception as e:
+        log.warning(f"AWS Translate failed ({e}), falling back to Google Translator.")
+        try:
             chunks_text = _split_into_chunks(text, 4500)
             translated_chunks = []
             for chunk_text in chunks_text:
                 translated_chunks.append(GoogleTranslator(source=src, target=tgt).translate(chunk_text))
-            return " ".join(translated_chunks)
-        raise
+            result = " ".join(translated_chunks)
+            if progress_cb: progress_cb(1, 1)
+            return result or text
+        except Exception as g_err:
+            log.error(f"Google Translator fallback also failed: {g_err}")
+            return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,6 +215,9 @@ def polish_translation_with_llm(
     Returns:
         Polished translated text, or the original if polishing fails.
     """
+    if not translated_text:
+        return translated_text or ""
+
     api_key = _get_secret("GROQ_API_KEY")
 
     if not api_key:
@@ -217,26 +250,27 @@ def polish_translation_with_llm(
         return translated_text
 
     try:
-        from groq import Groq
-        client = Groq(api_key=api_key)
-        for m_name in ["groq/compound-mini", "qwen/qwen3.8-27b"]:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        for m_name in ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]:
             try:
-                resp = client.chat.completions.create(
-                    model=m_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=4096,
-                    temperature=0.3,
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": m_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 4096,
+                        "temperature": 0.3,
+                    },
+                    timeout=30,
                 )
-                polished = resp.choices[0].message.content.strip()
-                log.info(f"LLM polish (Groq {m_name}): {len(translated_text)} -> {len(polished)} chars")
-                return polished
+                if resp.status_code == 200:
+                    polished = resp.json()["choices"][0]["message"]["content"].strip()
+                    log.info(f"LLM polish (Groq {m_name}): {len(translated_text)} -> {len(polished)} chars")
+                    return polished
             except Exception:
                 continue
         log.warning("LLM polish: No available Groq model responded.")
-        return translated_text
-
-    except ImportError:
-        log.warning("groq package not installed. Run: pip install groq")
         return translated_text
     except Exception as e:
         log.warning(f"LLM polish failed (using original translation): {e}")

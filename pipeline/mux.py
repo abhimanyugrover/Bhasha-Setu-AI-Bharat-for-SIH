@@ -18,9 +18,9 @@ try:
 except Exception:
     pass
 
-_ffmpeg_fallback = r"C:\Users\Abhimanyu\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\static_ffmpeg\bin\win32"
-if os.path.exists(_ffmpeg_fallback) and _ffmpeg_fallback not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = _ffmpeg_fallback + os.pathsep + os.environ.get("PATH", "")
+_custom_ffmpeg = os.environ.get("FFMPEG_PATH")
+if _custom_ffmpeg and os.path.exists(_custom_ffmpeg) and _custom_ffmpeg not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _custom_ffmpeg + os.pathsep + os.environ.get("PATH", "")
 
 log = logging.getLogger(__name__)
 

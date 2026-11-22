@@ -1,11 +1,18 @@
 # Credentials — NEVER commit these
 .streamlit/secrets.toml
+.streamlit/secrets*
+secrets*
+*.toml.txt
 .env
+*.env
+*.pem
+*.key
 
 # Pipeline outputs and cache
 output/
 cache/
 logs/
+*.part
 
 # Temp/build
 venv/
@@ -17,6 +24,12 @@ __pycache__/
 *.mp3
 *.wav
 *.mp4
+
+# Database and user data
+data/
+*.db
+*.db-wal
+*.db-shm
 
 # History
 bhasha_setu_history.json

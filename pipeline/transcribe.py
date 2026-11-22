@@ -14,6 +14,7 @@ prevent BadRequestException errors if an unsupported code is ever added.
 """
 
 import os
+import re
 import json
 import time
 import uuid
@@ -83,8 +84,8 @@ _SAFE_LANG_OPTIONS = [l for l in _PREFERRED_DETECT_LANGS if l in _VALID_TRANSCRI
 
 
 def _cache_path(s3_uri: str, lang_code) -> str:
-    safe   = s3_uri.replace("s3://", "").replace("/", "_").replace(".", "_")
-    suffix = lang_code.replace("-", "_") if lang_code else "auto"
+    safe   = re.sub(r"[^a-zA-Z0-9_-]", "_", s3_uri.replace("s3://", ""))
+    suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", lang_code) if lang_code else "auto"
     return os.path.join(CACHE_DIR, f"{safe}_{suffix}.json")
 
 
@@ -172,6 +173,8 @@ def transcribe_video(
             detected = job.get("LanguageCode") or source_language_code or "en-US"
 
             url = job["Transcript"]["TranscriptFileUri"]
+            if not isinstance(url, str) or not url.startswith("https://"):
+                raise ValueError(f"Invalid transcript URI returned: {url}")
             with urllib.request.urlopen(url, timeout=30) as r:
                 data = json.loads(r.read().decode("utf-8"))
 

@@ -1,0 +1,8 @@
+# robots.txt for Bhasha Setu (AI Bharat Multilingual Dubbing Platform)
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /data/
+Disallow: /logs/
+
+Sitemap: http://localhost:8501/sitemap.xml

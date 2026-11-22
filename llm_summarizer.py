@@ -17,6 +17,7 @@ Configuration — add ANY ONE of these to .streamlit/secrets.toml:
 
 import os
 import logging
+import requests
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -50,22 +51,26 @@ def _summarize_groq(transcript: str, language: str) -> Optional[str]:
     if not api_key:
         return None
     try:
-        from groq import Groq
-        client = Groq(api_key=api_key)
-        for m_name in ["groq/compound-mini", "qwen/qwen3.8-27b"]:
+        prompt_content = _PROMPT.replace("{language}", str(language)).replace("{transcript}", str(transcript))
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        messages = [{"role": "user", "content": prompt_content}]
+        for m_name in ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "llama-3.1-8b-instant", "llama3-8b-8192"]:
             try:
-                resp = client.chat.completions.create(
-                    model=m_name,
-                    messages=[{"role": "user", "content": _PROMPT.format(language=language, transcript=transcript)}],
-                    max_tokens=256,
-                    temperature=0.3,
+                payload = {
+                    "model": m_name,
+                    "messages": messages,
+                    "max_tokens": 256,
+                    "temperature": 0.3,
+                }
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers, json=payload, timeout=30,
                 )
-                return resp.choices[0].message.content.strip()
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
             except Exception:
                 continue
-        return None
-    except ImportError:
-        log.debug("groq package not installed — skipping Groq backend")
         return None
     except Exception as e:
         log.warning(f"Groq summarizer failed: {e}")
@@ -82,8 +87,9 @@ def _summarize_gemini(transcript: str, language: str) -> Optional[str]:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt_content = _PROMPT.replace("{language}", str(language)).replace("{transcript}", str(transcript))
         resp  = model.generate_content(
-            _PROMPT.format(language=language, transcript=transcript),
+            prompt_content,
             generation_config={"max_output_tokens": 256, "temperature": 0.3},
         )
         return resp.text.strip()

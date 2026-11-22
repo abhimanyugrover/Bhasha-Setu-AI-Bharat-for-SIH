@@ -4,6 +4,7 @@ Handles uploading local files to AWS S3.
 """
 
 import os
+import re
 import logging
 import boto3
 from botocore.exceptions import ClientError
@@ -19,7 +20,7 @@ def upload_to_s3(local_path: str, s3_key: str = None) -> str:
 
     Args:
         local_path: Path to the local file to upload.
-        s3_key:     S3 object key. Defaults to the file's basename.
+        s3_key:     S3 object key. Defaults to the file's sanitized basename.
 
     Returns:
         The S3 URI: s3://<bucket>/<key>
@@ -28,7 +29,11 @@ def upload_to_s3(local_path: str, s3_key: str = None) -> str:
         raise FileNotFoundError(f"File not found: {local_path}")
 
     if s3_key is None:
-        s3_key = os.path.basename(local_path)
+        clean_base = os.path.basename(local_path.replace("\\", "/"))
+        s3_key = re.sub(r"[^a-zA-Z0-9._-]", "_", clean_base)
+    else:
+        # Prevent traversal or unsafe S3 key prefixes
+        s3_key = s3_key.replace("..", "").lstrip("/\\")
 
     client = boto3.client("s3", region_name=AWS_REGION)
 
