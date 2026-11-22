@@ -232,6 +232,17 @@ def polish_translation_with_llm(
         snippet = original_text[:400].replace("\n", " ")
         context_block = f"\n\nOriginal {source_language} (for context):\n{snippet}"
 
+    # Query Neo4j GraphRAG for domain glossary and cultural idiom constraints
+    glossary_block = ""
+    try:
+        from pipeline.graph_db import query_graph_glossary
+        g_matches = query_graph_glossary(original_text or translated_text, target_lang_code=target_language.lower()[:2])
+        if g_matches:
+            g_lines = [f"• {m['concept']} ({m['domain']}): strictly use '{m['target_term']}' — {m['description']}" for m in g_matches[:4]]
+            glossary_block = f"\n\nVerified Indic Knowledge Graph Terminology:\n" + "\n".join(g_lines)
+    except Exception as ge:
+        log.debug(f"GraphRAG lookup skipped: {ge}")
+
     prompt = (
         f"You are a professional {target_language} translator specializing in "
         f"spoken-word content for video dubbing.\n\n"
@@ -240,7 +251,8 @@ def polish_translation_with_llm(
         f"aloud — fix awkward phrasing, unnatural idioms, and overly literal "
         f"translations. Keep the meaning identical. "
         f"Output ONLY the refined {target_language} text, nothing else.\n"
-        f"{context_block}\n\n"
+        f"{context_block}"
+        f"{glossary_block}\n\n"
         f"Machine-translated text:\n{translated_text}"
     )
 

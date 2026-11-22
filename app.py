@@ -1189,9 +1189,9 @@ if st.session_state.get("switch_tab") is not None:
         width=0,
     )
 
-t_home, t_dub, t_batch, t_hil, t_tr, t_chat, t_hist, t_road = st.tabs([
+t_home, t_dub, t_batch, t_hil, t_tr, t_chat, t_hist, t_graph, t_road = st.tabs([
     t("tab_home"), t("tab_dub"), t("tab_batch"), t("tab_review"),
-    t("tab_translate"), t("tab_chat"), t("tab_history"), t("tab_roadmap"),
+    t("tab_translate"), t("tab_chat"), t("tab_history"), "🕸️ Knowledge Graph", t("tab_roadmap"),
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3000,6 +3000,397 @@ with t_hist:
                 f'<span style="font-weight:600;color:var(--tx1);">{l_name}</span><span class="chip chip-p">{l_cnt} dubs</span></div>',
                 unsafe_allow_html=True,
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEO4J KNOWLEDGE GRAPH & MEDIA PROVENANCE STUDIO
+# ══════════════════════════════════════════════════════════════════════════════
+with t_graph:
+    from pipeline.graph_db import (
+        get_graph_statistics,
+        get_visual_graph_elements,
+        query_graph_glossary,
+        Neo4jGraphService,
+        INDIC_KNOWLEDGE_GLOSSARY,
+        init_graph_schema,
+        _load_local_graph,
+        _get_neo4j_config,
+    )
+
+    init_graph_schema()
+    g_stats = get_graph_statistics()
+
+    # 1. Header Banner & Status
+    is_live = g_stats.get("is_live_neo4j", False)
+    status_color = "#10B981" if is_live else "#F59E0B"
+    status_label = "Active Connected (Bolt / AuraDB)" if is_live else "Local Graph Engine (Sandbox Mode)"
+    status_desc = "Cluster operational" if is_live else "Seamless local cache active. Configure remote AuraDB credentials below."
+
+    st.markdown(
+        f"""
+        <div style="background:var(--glass);border:1px solid var(--bdr);border-radius:24px;padding:24px 28px;margin-bottom:20px;box-shadow:var(--sh);">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:12px;">
+                <div style="display:flex;align-items:center;gap:12px;">
+                    <div style="font-size:32px;filter:drop-shadow(0 2px 8px rgba(244,114,43,0.3));">🕸️</div>
+                    <div>
+                        <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--tx1);">
+                            Neo4j Multilingual Knowledge Graph &amp; Provenance Studio
+                        </div>
+                        <div style="font-size:12px;color:var(--tx2);">
+                            Cross-lingual semantic relationships, cultural vernacular preservation, and media pipeline DAG tracing.
+                        </div>
+                    </div>
+                </div>
+                <div style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:9999px;background:var(--sur2);border:1px solid var(--bdr2);font-size:11.5px;font-weight:700;color:var(--tx1);">
+                    <span style="width:8px;height:8px;border-radius:50%;background:{status_color};display:inline-block;box-shadow:0 0 8px {status_color};"></span>
+                    <span>{status_label}</span>
+                </div>
+            </div>
+            <div style="font-size:11.5px;color:var(--tx3);line-height:1.6;">
+                {status_desc}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 2. Metrics Row
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Total Graph Nodes", g_stats.get("total_nodes", 0))
+    with m2:
+        st.metric("Graph Relationships", g_stats.get("total_relationships", 0))
+    with m3:
+        st.metric("Indic Cultural Concepts", g_stats.get("concept_count", 0))
+    with m4:
+        st.metric("Dubbing Video Nodes", g_stats.get("video_count", 0))
+
+    st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
+
+    # 3. Interactive Force-Directed Canvas / Visualization
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+                <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700;color:var(--tx1);">
+                    🌐 Interactive Graph Explorer (Force-Directed Graph)
+                </div>
+                <div style="font-size:11.5px;color:var(--tx3);">
+                    Drag nodes to inspect relationships &bull; Colors represent node classes
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        visual_data = get_visual_graph_elements(limit=50)
+        nodes_json = json.dumps(visual_data["nodes"])
+        edges_json = json.dumps(visual_data["edges"])
+
+        # Embed high-performance standalone interactive HTML5 canvas simulation
+        graph_canvas_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <style>
+            body {{ margin: 0; padding: 0; background: transparent; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+            #graph-container {{ width: 100%; height: 420px; position: relative; background: rgba(14, 20, 35, 0.45); border-radius: 18px; border: 1px solid rgba(255,255,255,0.08); overflow: hidden; }}
+            canvas {{ width: 100%; height: 100%; display: block; }}
+            .legend {{ position: absolute; bottom: 12px; left: 16px; display: flex; gap: 10px; flex-wrap: wrap; pointer-events: none; }}
+            .legend-item {{ display: flex; align-items: center; gap: 5px; font-size: 11px; color: #CBD5E1; background: rgba(15,23,42,0.8); padding: 3px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); }}
+            .dot {{ width: 8px; height: 8px; border-radius: 50%; }}
+            #tooltip {{ position: absolute; display: none; background: #0F172A; color: #FFF; padding: 8px 12px; border-radius: 8px; font-size: 11.5px; border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 4px 16px rgba(0,0,0,0.5); pointer-events: none; max-width: 260px; z-index: 10; }}
+          </style>
+        </head>
+        <body>
+          <div id="graph-container">
+            <canvas id="cv"></canvas>
+            <div id="tooltip"></div>
+            <div class="legend">
+              <div class="legend-item"><span class="dot" style="background:#FF6B35"></span>Video</div>
+              <div class="legend-item"><span class="dot" style="background:#3B82F6"></span>Transcript</div>
+              <div class="legend-item"><span class="dot" style="background:#10B981"></span>Translation</div>
+              <div class="legend-item"><span class="dot" style="background:#8B5CF6"></span>VoicePersona</div>
+              <div class="legend-item"><span class="dot" style="background:#EC4899"></span>Concept</div>
+              <div class="legend-item"><span class="dot" style="background:#06B6D4"></span>Domain</div>
+            </div>
+          </div>
+          <script>
+            const rawNodes = {nodes_json};
+            const rawEdges = {edges_json};
+
+            const cv = document.getElementById('cv');
+            const ctx = cv.getContext('2d');
+            const tooltip = document.getElementById('tooltip');
+            let w, h;
+
+            function resize() {{
+              w = cv.width = cv.parentElement.clientWidth;
+              h = cv.height = cv.parentElement.clientHeight;
+            }}
+            window.addEventListener('resize', resize);
+            resize();
+
+            // Setup Nodes with 2D positions
+            const nodeMap = {{}};
+            const nodes = rawNodes.map((n, i) => {{
+              const angle = (i / rawNodes.length) * 2 * Math.PI;
+              const radius = Math.min(w, h) * 0.32 + (Math.random() - 0.5) * 60;
+              const node = {{
+                ...n,
+                x: w / 2 + Math.cos(angle) * radius,
+                y: h / 2 + Math.sin(angle) * radius,
+                vx: 0,
+                vy: 0,
+                radius: n.type === 'Concept' ? 14 : (n.type === 'Domain' ? 16 : 12),
+              }};
+              nodeMap[n.id] = node;
+              return node;
+            }});
+
+            const edges = rawEdges.map(e => ({{
+              source: nodeMap[e.source] || nodeMap[Object.keys(nodeMap)[0]],
+              target: nodeMap[e.target] || nodeMap[Object.keys(nodeMap)[0]],
+              label: e.label,
+            }})).filter(e => e.source && e.target);
+
+            // Simulation loop
+            function step() {{
+              // Repulsion
+              for (let i = 0; i < nodes.length; i++) {{
+                for (let j = i + 1; j < nodes.length; j++) {{
+                  const dx = nodes[j].x - nodes[i].x;
+                  const dy = nodes[j].y - nodes[i].y;
+                  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                  if (dist < 180) {{
+                    const force = (180 - dist) / dist * 0.45;
+                    nodes[i].vx -= dx * force * 0.05;
+                    nodes[i].vy -= dy * force * 0.05;
+                    nodes[j].vx += dx * force * 0.05;
+                    nodes[j].vy += dy * force * 0.05;
+                  }}
+                }}
+              }}
+
+              // Spring attraction
+              edges.forEach(e => {{
+                const dx = e.target.x - e.source.x;
+                const dy = e.target.y - e.source.y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                const force = (dist - 110) * 0.035;
+                e.source.vx += dx / dist * force;
+                e.source.vy += dy / dist * force;
+                e.target.vx -= dx / dist * force;
+                e.target.vy -= dy / dist * force;
+              }});
+
+              // Center gravity & update
+              nodes.forEach(n => {{
+                if (n !== dragNode) {{
+                  n.vx += (w / 2 - n.x) * 0.005;
+                  n.vy += (h / 2 - n.y) * 0.005;
+                  n.vx *= 0.82;
+                  n.vy *= 0.82;
+                  n.x += n.vx;
+                  n.y += n.vy;
+                  n.x = Math.max(25, Math.min(w - 25, n.x));
+                  n.y = Math.max(25, Math.min(h - 25, n.y));
+                }}
+              }});
+
+              draw();
+              requestAnimationFrame(step);
+            }}
+
+            function draw() {{
+              ctx.clearRect(0, 0, w, h);
+
+              // Draw edges
+              edges.forEach(e => {{
+                ctx.beginPath();
+                ctx.moveTo(e.source.x, e.source.y);
+                ctx.lineTo(e.target.x, e.target.y);
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+                ctx.lineWidth = 1.2;
+                ctx.stroke();
+
+                // Draw edge arrow
+                const midX = (e.source.x + e.target.x) / 2;
+                const midY = (e.source.y + e.target.y) / 2;
+                ctx.fillStyle = 'rgba(148, 163, 184, 0.6)';
+                ctx.font = '9px sans-serif';
+                ctx.fillText(e.label, midX + 4, midY - 3);
+              }});
+
+              // Draw nodes
+              nodes.forEach(n => {{
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, n.radius, 0, 2 * Math.PI);
+                ctx.fillStyle = n.color;
+                ctx.fill();
+                ctx.lineWidth = 2.5;
+                ctx.strokeStyle = n.borderColor;
+                ctx.stroke();
+
+                // Labels
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = 'bold 10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(n.label, n.x, n.y + n.radius + 13);
+              }});
+            }}
+
+            // Drag handling
+            let dragNode = null;
+            cv.addEventListener('mousedown', e => {{
+              const rect = cv.getBoundingClientRect();
+              const mx = e.clientX - rect.left;
+              const my = e.clientY - rect.top;
+              dragNode = nodes.find(n => Math.hypot(n.x - mx, n.y - my) <= n.radius + 5);
+            }});
+            window.addEventListener('mousemove', e => {{
+              const rect = cv.getBoundingClientRect();
+              const mx = e.clientX - rect.left;
+              const my = e.clientY - rect.top;
+              if (dragNode) {{
+                dragNode.x = mx;
+                dragNode.y = my;
+              }}
+              // Tooltip on hover
+              const hover = nodes.find(n => Math.hypot(n.x - mx, n.y - my) <= n.radius + 5);
+              if (hover) {{
+                tooltip.style.display = 'block';
+                tooltip.style.left = (mx + 15) + 'px';
+                tooltip.style.top = (my + 10) + 'px';
+                tooltip.innerHTML = `<strong>${{hover.label}}</strong><br><span style="color:#94A3B8;">Type: ${{hover.type}}</span><br>${{hover.details}}`;
+              }} else if (!dragNode) {{
+                tooltip.style.display = 'none';
+              }}
+            }});
+            window.addEventListener('mouseup', () => {{ dragNode = null; }});
+
+            step();
+          </script>
+        </body>
+        </html>
+        """
+        import streamlit.components.v1 as _components
+        _components.html(graph_canvas_html, height=440)
+
+    st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+
+    # 4. Tabbed Sub-Panels (Glossary Explorer, Provenance DAG, Connection Settings)
+    gt1, gt2, gt3 = st.tabs([
+        "💡 Cultural Vernacular & GraphRAG Glossary",
+        "🔗 Media Provenance & Lineage DAG",
+        "⚙️ Neo4j Cluster Configuration",
+    ])
+
+    with gt1:
+        st.markdown(
+            """
+            <div style="font-size:13px;color:var(--tx2);margin-bottom:12px;">
+                Verified Indian administrative schemes, agricultural concepts, and cultural idioms mapped across regional Indic languages.
+                These constraints are queried dynamically during neural translation to prevent awkward literal phrasing.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        search_kw = st.text_input("🔍 Search Concepts or Regional Idioms", placeholder="e.g. PM-KISAN, UPI, apple of eye, kisan, health", key="graph_search_kw")
+
+        items_to_show = INDIC_KNOWLEDGE_GLOSSARY
+        if search_kw:
+            skw = search_kw.lower().strip()
+            items_to_show = [
+                it for it in INDIC_KNOWLEDGE_GLOSSARY
+                if skw in it["canonical_name"].lower()
+                or skw in it["domain"].lower()
+                or skw in it["description"].lower()
+                or any(skw in tv.lower() for tv in it["terms"].values())
+            ]
+
+        for item in items_to_show:
+            with st.expander(f"📌 {item['canonical_name']} · {item['domain']}", expanded=bool(search_kw)):
+                st.markdown(f"**Description:** {item['description']}")
+                st.markdown("**Cross-Lingual Verified Equivalents:**")
+                tcols = st.columns(4)
+                terms_list = list(item["terms"].items())
+                for i, (l_code, l_val) in enumerate(terms_list):
+                    with tcols[i % 4]:
+                        l_name = {"en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "kn": "Kannada", "mr": "Marathi", "bn": "Bengali", "pa": "Punjabi"}.get(l_code, l_code.upper())
+                        st.markdown(
+                            f'<div style="background:var(--sur2);border:1px solid var(--bdr);border-radius:12px;padding:8px 12px;margin-bottom:8px;">'
+                            f'<div style="font-size:10px;font-weight:700;color:var(--p1);">{l_name}</div>'
+                            f'<div style="font-size:12.5px;font-weight:600;color:var(--tx1);">{l_val}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+    with gt2:
+        st.markdown(
+            """
+            <div style="font-size:13px;color:var(--tx2);margin-bottom:14px;">
+                Cryptographic DAG tracking the complete lineage of every video processed by Bhasha Setu:
+                <code>Raw Video &rarr; Speech Transcript &rarr; Neural Translation &rarr; Synthesized Persona &rarr; Dubbed Master MP4</code>.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        local_g = _load_local_graph()
+        video_nodes = [n for n in local_g.get("nodes", {}).values() if n.get("label") == "Video"]
+        if not video_nodes:
+            st.info("ℹ️ No dubbing jobs recorded in the provenance graph yet. Run a dubbing job in the 'Dub Video' tab to populate this DAG.")
+        else:
+            for vn in reversed(video_nodes[-10:]):
+                v_id = vn.get("video_id", "unknown")
+                v_title = vn.get("title", f"Video {v_id}")
+                v_status = vn.get("status", "COMPLETED")
+                v_out = vn.get("output_file", "")
+                st.markdown(
+                    f'<div style="background:var(--glass);border:1px solid var(--bdr);border-radius:16px;padding:14px 18px;margin-bottom:10px;">'
+                    f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">'
+                    f'<span style="font-weight:700;font-size:13.5px;color:var(--tx1);">🎥 {v_title}</span>'
+                    f'<span class="chip chip-p">{v_status}</span>'
+                    f'</div>'
+                    f'<div style="font-size:11.5px;color:var(--tx2);">'
+                    f'Lineage: <code>{vn.get("source_lang", "Auto")} &rarr; {vn.get("target_lang", "Indic")}</code> &bull; Job ID: <code>{v_id}</code>'
+                    f'{" &bull; Output: <code>" + v_out + "</code>" if v_out else ""}'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    with gt3:
+        st.markdown(
+            """
+            <div style="font-size:13px;color:var(--tx2);margin-bottom:14px;">
+                Connect Bhasha Setu to a <strong>Neo4j AuraDB Cloud Instance</strong> (Free Tier) or a local <strong>Docker Neo4j container</strong>.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        cur_uri, cur_user, cur_pwd, cur_db, is_cfg = _get_neo4j_config()
+        n_col1, n_col2 = st.columns(2)
+        with n_col1:
+            neo_uri_input = st.text_input("Neo4j Bolt URI", value=cur_uri or "neo4j+s://your-instance.databases.neo4j.io", key="cfg_neo_uri")
+            neo_user_input = st.text_input("Neo4j Username", value=cur_user or "neo4j", key="cfg_neo_user")
+        with n_col2:
+            neo_pwd_input = st.text_input("Neo4j Password", value=cur_pwd or "", type="password", key="cfg_neo_pwd")
+            neo_db_input = st.text_input("Database Name", value=cur_db or "neo4j", key="cfg_neo_db")
+
+        if st.button("🔌 Test & Verify Neo4j Connection", type="primary", use_container_width=True, key="btn_test_neo4j"):
+            os.environ["NEO4J_URI"] = neo_uri_input.strip()
+            os.environ["NEO4J_USERNAME"] = neo_user_input.strip()
+            os.environ["NEO4J_PASSWORD"] = neo_pwd_input.strip()
+            os.environ["NEO4J_DATABASE"] = neo_db_input.strip()
+            Neo4jGraphService._driver = None
+            ok, msg, meta = Neo4jGraphService.test_connection()
+            if ok:
+                st.success(f"✅ {msg}")
+                st.json(meta)
+            else:
+                st.warning(f"⚠️ {msg}")
+                st.info("Tip: Create a free Neo4j AuraDB instance at https://neo4j.com/cloud/platform/aura-graph-database/ and paste the URI and password here.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

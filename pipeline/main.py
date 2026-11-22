@@ -396,6 +396,13 @@ def run_pipeline(
             s3_uri = upload_to_s3(video_path, s3_key)
             _prog(1, 100, f"Uploaded → {s3_uri}")
 
+            # Record provenance node in Neo4j Knowledge Graph
+            try:
+                from pipeline.graph_db import record_video_pipeline_start
+                record_video_pipeline_start(job_id, clean_base, source_language or "Auto-detect", target_language, video_path)
+            except Exception as ge:
+                log.debug(f"Neo4j record start skipped: {ge}")
+
             try:
                 # Stage 2: Transcribe (any language)
                 lang_note = f"({source_language})" if source_language != "Auto-detect" else "(auto-detect)"
@@ -411,6 +418,13 @@ def run_pipeline(
                     source_language_code=src_tc,
                 )
                 _prog(2, 100, f"Transcript ready ({len(transcript or '')} chars) — detected: {detected_tc}")
+
+                # Record transcript & extract mentioned Indic entities in Neo4j
+                try:
+                    from pipeline.graph_db import record_transcript_event
+                    record_transcript_event(job_id, transcript, detected_tc, word_timestamps)
+                except Exception as ge:
+                    log.debug(f"Neo4j transcript logging skipped: {ge}")
             finally:
                 # Delete staging video from S3 once transcription is complete or if it failed
                 if s3_key:
@@ -463,6 +477,13 @@ def run_pipeline(
             else:
                 _prog(3, 100, f"Translation ready ({len(translation or '')} chars)")
 
+            # Record translation node in Neo4j Knowledge Graph
+            try:
+                from pipeline.graph_db import record_translation_event
+                record_translation_event(job_id, target_language, translation, engine=translate_engine or "Mayura:v1")
+            except Exception as ge:
+                log.debug(f"Neo4j translation logging skipped: {ge}")
+
             srt_path = ""
             if generate_srt and word_timestamps:
                 try:
@@ -498,6 +519,14 @@ def run_pipeline(
                 mux(video_path, mp3_path, output_path,
                     progress_cb=mux_progress, vol_boost=vol_boost, bg_music_vol=bg_music_vol)
                 _prog(5, 100, f"Mux complete → {os.path.basename(output_path)}")
+
+                # Complete full DAG provenance trace in Neo4j
+                try:
+                    from pipeline.graph_db import record_synthesis_event, complete_video_pipeline
+                    record_synthesis_event(job_id, target_language, sarvam_speaker or "meera", engine=tts_engine or "Bulbul:v3", audio_path=output_path)
+                    complete_video_pipeline(job_id, output_path)
+                except Exception as ge:
+                    log.debug(f"Neo4j completion logging skipped: {ge}")
             finally:
                 if os.path.exists(mp3_path):
                     try: os.remove(mp3_path)

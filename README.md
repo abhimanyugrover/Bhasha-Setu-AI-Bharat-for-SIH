@@ -230,6 +230,22 @@ Access the studio at `http://localhost:8501`.
 
 ## 📜 Commit History & Release Notes
 
+### Commit `feat(neo4j)` — *Enterprise Neo4j Multilingual Knowledge Graph & Provenance DAG Studio*
+
+#### 🕸️ 1. Native Neo4j Integration & Resilient Hybrid Fallback
+* **Linguistic GraphRAG Engine**: Built `pipeline/graph_db.py` integrating the official `neo4j` Python driver to model cross-lingual semantic relationships, regional Indian idioms, and government scheme terminologies across 12+ official Indic languages.
+* **Context-Aware Translation Prompting**: Integrated GraphRAG lookups into `pipeline/translate.py` so machine translations and LLM polish passes dynamically inject verified cultural idioms and administrative concepts (e.g., PM-KISAN, Ayushman Bharat, DBT, UPI, MSP), eliminating literal or awkward machine-translation phrasing.
+* **Full Media Provenance DAG**: Implemented end-to-end lineage tracking across the pipeline: `(:RawVideo) -> [:TRANSCRIBED_INTO] -> (:Transcript) -> [:TRANSLATED_BY] -> (:Translation) -> [:SYNTHESIZED_TO] -> (:DubbedAudio) -> [:VOICED_BY] -> (:VoicePersona)`.
+* **Zero-Downtime Resilience**: Implemented a local JSON graph cache fallback (`data/knowledge_graph.json`) that seeds and operates the knowledge graph automatically even before a remote Neo4j AuraDB cluster is configured, ensuring the app never fails or blocks if Neo4j is offline.
+
+#### 🎨 2. Interactive Knowledge Graph Explorer UI
+* Added a dedicated **"🕸️ Knowledge Graph"** tab into the floating navigation capsule dock.
+* **Interactive Force-Directed Network Visualizer**: Embedded an interactive 2D physics simulation rendering video nodes, transcripts, voice personas, and conceptual domains with drag-to-inspect physics and hover tooltips.
+* **Cross-Lingual Glossary Explorer**: Multi-language translation lookup table for verified regional vernacular equivalents across Hindi, Tamil, Telugu, Kannada, Marathi, Bengali, and Punjabi.
+* **Neo4j Cluster Configuration Card**: Live credential validator and latency diagnostics for connecting local Docker Neo4j or Neo4j AuraDB cloud instances.
+
+---
+
 ### Commit `9c77252` — *Fix: Google OAuth CSRF State Verification & Dark Mode UI Contrast*
 
 #### 🔐 1. Google OAuth 2.0 Anti-CSRF Token Security
