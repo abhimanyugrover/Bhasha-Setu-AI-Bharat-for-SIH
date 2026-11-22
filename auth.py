@@ -105,13 +105,18 @@ def init_db() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user_id ON history(user_id);")
 
-        # OAuth single-use anti-CSRF state tokens
+        # OAuth single-use anti-CSRF state tokens with epoch expiration
         conn.execute("""
             CREATE TABLE IF NOT EXISTS oauth_states (
                 state TEXT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at REAL
             );
         """)
+        try:
+            conn.execute("ALTER TABLE oauth_states ADD COLUMN expires_at REAL;")
+        except Exception:
+            pass
 
         # Security audit log
         conn.execute("""
@@ -478,26 +483,70 @@ def get_google_oauth_config() -> Tuple[str, str, str, bool]:
 
 def create_oauth_state() -> str:
     """Generate and store a single-use cryptographically secure state token to prevent CSRF."""
+    now = time.time()
+    # Reuse active session token if generated in last 10 minutes to avoid tab collision
+    try:
+        import streamlit as _st
+        cached = _st.session_state.get("_active_oauth_state")
+        cached_time = _st.session_state.get("_active_oauth_state_time", 0)
+        if cached and (now - cached_time < 600):
+            return cached
+    except Exception:
+        pass
+
     state = secrets.token_urlsafe(32)
-    with _get_db() as conn:
-        ten_mins_ago = (datetime.now() - timedelta(minutes=10)).isoformat()
-        conn.execute("DELETE FROM oauth_states WHERE created_at < ?;", (ten_mins_ago,))
-        conn.execute("INSERT INTO oauth_states (state) VALUES (?);", (state,))
+    expires_at = now + 1800.0  # 30-minute validity window
+    try:
+        with _get_db() as conn:
+            # Purge expired tokens using numeric epoch comparison
+            conn.execute("DELETE FROM oauth_states WHERE expires_at IS NOT NULL AND expires_at < ?;", (now,))
+            conn.execute("INSERT OR REPLACE INTO oauth_states (state, expires_at) VALUES (?, ?);", (state, expires_at))
+    except Exception as e:
+        log.warning(f"Error persisting oauth state in db: {e}")
+
+    try:
+        import streamlit as _st
+        _st.session_state["_active_oauth_state"] = state
+        _st.session_state["_active_oauth_state_time"] = now
+    except Exception:
+        pass
+
     return state
 
 
 def verify_and_consume_oauth_state(state: str) -> bool:
-    """Verify that an OAuth state token exists and consume it immediately."""
+    """Verify that an OAuth state token exists, is unexpired, and consume it immediately."""
     if not state:
         return False
-    with _get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT state FROM oauth_states WHERE state = ?;", (state,))
-        row = cur.fetchone()
-        if not row:
-            return False
-        conn.execute("DELETE FROM oauth_states WHERE state = ?;", (state,))
-        return True
+    now = time.time()
+    verified = False
+
+    # Layer 1: In-memory session state verification
+    try:
+        import streamlit as _st
+        cached = _st.session_state.get("_active_oauth_state")
+        if cached and secrets.compare_digest(cached, state):
+            verified = True
+            _st.session_state.pop("_active_oauth_state", None)
+            _st.session_state.pop("_active_oauth_state_time", None)
+    except Exception:
+        pass
+
+    # Layer 2: SQLite database verification
+    try:
+        with _get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT state, expires_at FROM oauth_states WHERE state = ?;", (state,))
+            row = cur.fetchone()
+            if row:
+                exp = row["expires_at"] if "expires_at" in row.keys() else None
+                if exp is None or exp >= now:
+                    verified = True
+                conn.execute("DELETE FROM oauth_states WHERE state = ?;", (state,))
+    except Exception as e:
+        log.warning(f"Error querying oauth_states in db: {e}")
+
+    return verified
 
 
 def get_google_auth_url() -> Tuple[Optional[str], Optional[str]]:
@@ -836,16 +885,20 @@ def render_login_page() -> None:
     code = q_params.get("code")
     state = q_params.get("state")
     if code and state:
-        with st.spinner("Verifying credentials with Google Identity Services…"):
-            user, err = exchange_google_code(code, state)
+        if st.session_state.get("_processed_oauth_code") == code:
             st.query_params.clear()
-            if user:
-                st.session_state.auth_user = user
-                st.session_state.last_activity = datetime.now().timestamp()
-                st.success(f"Welcome back, {user.get('name') or user['username']}!")
-                st.rerun()
-            else:
-                st.error(f"Google Authentication Error: {err}")
+        else:
+            st.session_state["_processed_oauth_code"] = code
+            with st.spinner("Verifying credentials with Google Identity Services…"):
+                user, err = exchange_google_code(code, state)
+                st.query_params.clear()
+                if user:
+                    st.session_state.auth_user = user
+                    st.session_state.last_activity = datetime.now().timestamp()
+                    st.success(f"Welcome back, {user.get('name') or user['username']}!")
+                    st.rerun()
+                else:
+                    st.error(f"Google Authentication Error: {err}")
 
     # Check for session expiration notice
     if st.session_state.get("session_expired_msg"):

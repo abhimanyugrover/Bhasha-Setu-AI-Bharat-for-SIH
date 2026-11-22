@@ -177,32 +177,6 @@ for k, v in _DEFAULTS.items():
 DM = st.session_state.dark_mode
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DESIGN SYSTEM
-# ══════════════════════════════════════════════════════════════════════════════
-DARK_CSS = """
-:root {
-  --bg:#080B14; --bg1:#0D1322; --bg2:#121A2D; --bg3:#18223B;
-  --sur:rgba(255,255,255,.04); --sur2:rgba(255,255,255,.075); --sur3:rgba(255,255,255,.11);
-  --bdr:rgba(255,255,255,.08); --bdr2:rgba(255,255,255,.18);
-  --tx1:#FFFFFF; --tx2:#CBD5E1; --tx3:#8E9EB6; --tx4:#475569;
-  --p1:#FF6B35; --p2:#FB923C;
-  --pg:linear-gradient(135deg,#FF6B35 0%,#EA580C 100%);
-  --pg2:linear-gradient(135deg,#FF6B35 0%,#F97316 40%,#EA580C 100%);
-  --a1:#22D3EE; --ag:linear-gradient(135deg,#22D3EE,#818CF8);
-  --g1:#34D399; --gs:rgba(52,211,153,.09); --gb:rgba(52,211,153,.22);
-  --am1:#FBBF24; --ams:rgba(251,191,36,.09); --amb:rgba(251,191,36,.22);
-  --r1:#F87171; --rs:rgba(248,113,113,.09); --rb:rgba(248,113,113,.22);
-  --ps:rgba(255,107,53,.10); --pb:rgba(255,107,53,.24);
-  --glass:rgba(14,20,35,.72); --glass2:rgba(22,30,52,.80);
-  --trk:rgba(255,255,255,.08);
-  --inp:rgba(255,255,255,.06); --inpb:rgba(255,255,255,.14);
-  --sh:0 2px 14px rgba(0,0,0,.55),0 8px 32px rgba(0,0,0,.40);
-  --sh2:0 6px 28px rgba(0,0,0,.68),0 16px 48px rgba(0,0,0,.48);
-  --psh:0 4px 20px rgba(255,107,53,.35),0 8px 40px rgba(255,107,53,.18);
-  --rad:28px; --rad-lg:34px; --rad-sm:9999px; --rad-pill:9999px;
-}
-"""
-# ══════════════════════════════════════════════════════════════════════════════
 #  DESIGN SYSTEM (Figma & Snitch Modern Multilingual UI)
 # ══════════════════════════════════════════════════════════════════════════════
 DARK_CSS = """
@@ -240,8 +214,8 @@ DARK_CSS = """
   --glass: rgba(18, 26, 45, 0.78);
   --glass2: rgba(24, 34, 59, 0.85);
   --trk: rgba(255, 255, 255, 0.08);
-  --inp: rgba(255, 255, 255, 0.06);
-  --inpb: rgba(255, 255, 255, 0.15);
+  --inp: #131C2E;
+  --inpb: rgba(255, 255, 255, 0.16);
   --sh: 0 2px 14px rgba(0, 0, 0, 0.55), 0 8px 32px rgba(0, 0, 0, 0.40);
   --sh2: 0 6px 28px rgba(0, 0, 0, 0.68), 0 16px 48px rgba(0, 0, 0, 0.48);
   --psh: 0 4px 20px rgba(255, 107, 53, 0.35), 0 8px 40px rgba(255, 107, 53, 0.18);
@@ -664,15 +638,28 @@ div[data-testid="stCheckbox"] span[data-baseweb="checkbox"]{
 [data-testid="stTextArea"] textarea::placeholder{color:var(--tx3)!important;}
 
 /* SELECTBOXES: FULL CIRCULAR CAPSULE WITH CRISP CONTRAST */
-[data-testid="stSelectbox"]>div>div{
-  background:var(--inp)!important;border:1.5px solid var(--inpb)!important;
-  border-radius:9999px!important;color:var(--tx1)!important;
-  min-height:46px!important;font-size:13.5px!important;font-weight:500!important;
-  padding-left:18px!important;padding-right:18px!important;
-  transition:border-color .18s,box-shadow .18s!important;
+[data-testid="stSelectbox"] > div > div,
+[data-baseweb="select"] > div,
+div[data-baseweb="select"],
+div[data-baseweb="select"] > div:first-child,
+div[data-baseweb="select"] input {
+  background: var(--inp) !important;
+  background-color: var(--inp) !important;
+  border: 1.5px solid var(--inpb) !important;
+  border-radius: 9999px !important;
+  color: var(--tx1) !important;
+  min-height: 46px !important;
+  font-size: 13.5px !important;
+  font-weight: 500 !important;
+  transition: border-color .18s, box-shadow .18s !important;
 }
-[data-testid="stSelectbox"]>div>div:hover{
-  border-color:var(--p1)!important;
+[data-testid="stSelectbox"] > div > div:hover,
+[data-baseweb="select"] > div:hover {
+  border-color: var(--p1) !important;
+}
+[data-baseweb="select"] > div:focus-within {
+  border-color: var(--p1) !important;
+  box-shadow: 0 0 0 3px rgba(244, 114, 43, 0.22) !important;
 }
 [data-testid="stSelectbox"] *,
 [data-baseweb="select"] * {
@@ -694,37 +681,26 @@ label[data-testid="stWidgetLabel"] span {
 }
 
 ul[data-baseweb="menu"],
+div[data-baseweb="popover"],
 div[data-baseweb="popover"] > div {
-  background:var(--bg1)!important;
-  border:1px solid var(--bdr2)!important;
-  border-radius:20px!important;
-  box-shadow:var(--sh2)!important;
-  padding:8px!important;
+  background: var(--bg1) !important;
+  background-color: var(--bg1) !important;
+  border: 1px solid var(--bdr2) !important;
+  border-radius: 20px !important;
+  box-shadow: var(--sh2) !important;
+  padding: 8px !important;
 }
-li[data-baseweb="menu-item"]{
-  border-radius:12px!important;
-  padding:9px 16px!important;
-  font-size:13.5px!important;
-  color:var(--tx1)!important;
-  font-weight:600!important;
+li[data-baseweb="menu-item"] {
+  border-radius: 12px !important;
+  padding: 9px 16px !important;
+  font-size: 13.5px !important;
+  color: var(--tx1) !important;
+  font-weight: 600 !important;
+  background: transparent !important;
 }
-li[data-baseweb="menu-item"]:hover{
-  background:var(--sur2)!important;
-  color:var(--p1)!important;
-}
-  border-radius:18px!important;
-  box-shadow:var(--sh2)!important;
-  padding:8px!important;
-}
-li[data-baseweb="menu-item"]{
-  border-radius:10px!important;
-  padding:9px 14px!important;
-  font-size:13px!important;
-  color:var(--tx1)!important;
-}
-li[data-baseweb="menu-item"]:hover{
-  background:var(--sur2)!important;
-  color:var(--p1)!important;
+li[data-baseweb="menu-item"]:hover {
+  background: var(--sur2) !important;
+  color: var(--p1) !important;
 }
 
 /* SLIDERS */
